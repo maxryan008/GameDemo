@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::iter;
+use std::ops::Sub;
 use cgmath::prelude::*;
 use cgmath::Vector3;
 use log::logger;
-use wgpu::Device;
+use wgpu::{Device, Queue};
+use wgpu::naga::TypeInner::Vector;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -18,7 +20,7 @@ use crate::{camera, logger, vertex_types, voxels, world_generation};
 use crate::texture;
 use crate::vertex_types::{Vertex, WorldMeshVertex};
 
-const CULL_BACK_FACE: bool = true;
+const CULL_BACK_FACE: bool = false;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -58,19 +60,6 @@ impl MeshBuffer {
     }
 }
 
-struct ChunkBuffers {
-    chunks: HashMap<Vector3<u32>, MeshBufferRaw>
-}
-
-impl ChunkBuffers {
-    pub fn new() -> Self {
-        ChunkBuffers
-        {
-            chunks: HashMap::new(),
-        }
-    }
-}
-
 impl MeshBufferRaw {
     pub fn new() -> Self {
         MeshBufferRaw
@@ -80,6 +69,14 @@ impl MeshBufferRaw {
             index_buffer: vec![],
         }
     }
+}
+
+struct BufferIndexer {
+    //position key, u32 as order, u32 as size, u32 as vertex size
+    by_position: HashMap<Vector3<u32>, (u32, u32, u32)>,
+    //order key, position value, u32 as size, u32 as vertex size
+    by_order: Vec<(Vector3<u32>, u32, u32)>,
+    total_index_size: u32,
 }
 
 impl CameraUniform {
@@ -103,8 +100,9 @@ struct State<'a> {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    chunk_buffers: ChunkBuffers,
     calculated_buffer: MeshBuffer,
+    raw_buffer: MeshBufferRaw,
+    buffer_indexer: BufferIndexer,
     camera: camera::Camera,
     projection: camera::Projection,
     camera_controller: camera::CameraController,
@@ -284,7 +282,7 @@ impl<'a> State<'a> {
         let camera = camera::Camera::new((0.0, 0.0, 1.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
             camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
-        let camera_controller = camera::CameraController::new(4.0, 1.0);
+        let camera_controller = camera::CameraController::new(100.0, 1.0);
 
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
@@ -346,27 +344,16 @@ impl<'a> State<'a> {
             )
         };
 
-        // let mut vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //     label: Some("Vertex Buffer"),
-        //     //contents: bytemuck::cast_slice(world_generation::VERTICES),
-        //     contents: &*vec![],
-        //     usage: wgpu::BufferUsages::VERTEX,
-        // });
-        // let mut index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //     label: Some("Index Buffer"),
-        //     //contents: bytemuck::cast_slice(world_generation::INDICES),
-        //     contents: &*vec![],
-        //     usage: wgpu::BufferUsages::INDEX,
-        // });
-
-        //let num_indices = world_generation::INDICES.len() as u32;
-        //let num_indices = 0;
-
         let mut world = world_generation::World::new();
 
         let calculated_buffer: MeshBuffer = MeshBuffer::new(&device);
-
-        let chunk_buffers: ChunkBuffers = ChunkBuffers::new();
+        let raw_buffer: MeshBufferRaw = MeshBufferRaw::new();
+        let buffer_indexer: BufferIndexer = BufferIndexer
+        {
+            by_position: Default::default(),
+            by_order: Default::default(),
+            total_index_size: 0,
+        };
         Self {
             window,
             surface,
@@ -382,8 +369,9 @@ impl<'a> State<'a> {
             camera_uniform,
             depth_texture,
             size,
-            chunk_buffers,
             calculated_buffer,
+            raw_buffer,
+            buffer_indexer,
             diffuse_texture,
             diffuse_bind_group,
             #[allow(dead_code)]
@@ -446,55 +434,119 @@ impl<'a> State<'a> {
     }
 
     fn rebuild_chunk(&mut self, position: Vector3<u32>) {
-        let mut vertex_vector: Vec<WorldMeshVertex> = Vec::new();
-        let mut index_vector: Vec<u32> = Vec::new();
-
-        let chunk_raw = self.world.get_raw_chunk(&position);
-
-
-        let mut rebuilding_chunk: MeshBufferRaw = MeshBufferRaw
-        {
-            vertex_buffer: chunk_raw.vertices.clone(),
-            index_buffer: chunk_raw.indices.clone(),
-            num_indices: chunk_raw.indices.len() as u32,
-        };
-
-        for mut chunk in self.chunk_buffers.chunks.iter_mut()
-        {
-            if (chunk.0 != &position)
+        if self.buffer_indexer.by_position.contains_key(&position) {
+            //rebuilding old chunk
+            let order: u32 = self.buffer_indexer.by_position.get(&position).unwrap().0;
+            let mut indexer: u32 = 0;
+            for i in 0..=order
             {
-                vertex_vector.extend(&chunk.1.vertex_buffer);
-                index_vector.extend(&chunk.1.index_buffer);
-            } else {
-                vertex_vector.extend(&chunk_raw.vertices);
-                index_vector.extend(&chunk_raw.indices);
-                chunk.1 = &mut rebuilding_chunk;
+                indexer += self.buffer_indexer.by_order[i as usize].1;
             }
+            let mut vertexer: u32 = 0;
+            for i in 0..=order
+            {
+                vertexer += self.buffer_indexer.by_order[i as usize].2;
+            }
+            let chunk_raw = self.world.get_raw_chunk(&position,indexer);
+            self.buffer_indexer.total_index_size += chunk_raw.indices.len() as u32 - self.buffer_indexer.by_order.get(order as usize).unwrap().1;
+            self.raw_buffer.num_indices += chunk_raw.indices.len() as u32 - self.buffer_indexer.by_order.get(order as usize).unwrap().1;
+            let (left_v, right_v) = self.raw_buffer.vertex_buffer.split_at(vertexer as usize);
+            let (left_v, _) = left_v.split_at((vertexer - self.buffer_indexer.by_position.get(&position).unwrap().2) as usize);
+            let (left_i, right_i) = self.raw_buffer.index_buffer.split_at(indexer as usize);
+            let (left_i, _) = left_i.split_at((indexer - self.buffer_indexer.by_position.get(&position).unwrap().1) as usize);
+            let mut left_v_vec = left_v.to_vec();
+            let mut left_i_vec = left_i.to_vec();
+            left_v_vec.extend_from_slice(&chunk_raw.vertices);
+            left_i_vec.extend_from_slice(&chunk_raw.indices);
+            left_v_vec.extend_from_slice(right_v);
+            left_i_vec.extend_from_slice(right_i);
+            self.buffer_indexer.by_position.remove(&position);
+            self.buffer_indexer.by_position.insert(position,(order, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
+            self.buffer_indexer.by_order.remove(order as usize);
+            self.buffer_indexer.by_order.insert(order as usize,(position, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
+            self.raw_buffer.index_buffer = left_i_vec;
+            self.raw_buffer.vertex_buffer = left_v_vec;
+        }else {
+            //building new chunk
+            let order: u32 = self.buffer_indexer.by_position.len() as u32;
+            let chunk_raw = self.world.get_raw_chunk(&position,self.buffer_indexer.total_index_size);
+            self.buffer_indexer.by_position.insert(position,(order, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
+            self.buffer_indexer.by_order.insert(order as usize,(position, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
+            self.buffer_indexer.total_index_size += chunk_raw.indices.len() as u32;
+            self.raw_buffer.num_indices += chunk_raw.indices.len() as u32;
+            self.raw_buffer.index_buffer.extend(&chunk_raw.indices);
+            self.raw_buffer.vertex_buffer.extend(&chunk_raw.vertices);
         }
 
-        if !(self.chunk_buffers.chunks.contains_key(&position))
-        {
-            vertex_vector.extend(&chunk_raw.vertices);
-            index_vector.extend(&chunk_raw.indices);
-            self.chunk_buffers.chunks.insert(position, rebuilding_chunk);
-        }
+        self.submit_buffer();
+    }
 
+    fn unload_chunk(&mut self, position: Vector3<u32>)
+    {
+        if self.buffer_indexer.by_position.contains_key(&position) {
+            let order: u32 = self.buffer_indexer.by_position.get(&position).unwrap().0;
+            let mut indexer: u32 = 0;
+            for i in 0..=order
+            {
+                indexer += self.buffer_indexer.by_order[i as usize].1;
+            }
+            let mut vertexer: u32 = 0;
+            for i in 0..=order
+            {
+                vertexer += self.buffer_indexer.by_order[i as usize].2;
+            }
+            let index_size = self.buffer_indexer.by_position.get(&position).unwrap().1;
+            let vertex_size = self.buffer_indexer.by_position.get(&position).unwrap().2;
+            let (left_v, right_v) = self.raw_buffer.vertex_buffer.split_at(vertexer as usize);
+            let (left_v, _) = left_v.split_at((vertexer - self.buffer_indexer.by_position.get(&position).unwrap().2) as usize);
+            let (left_i, right_i) = self.raw_buffer.index_buffer.split_at(indexer as usize);
+            let (left_i, _) = left_i.split_at((indexer - self.buffer_indexer.by_position.get(&position).unwrap().1) as usize);
+            let mut left_v_vec = left_v.to_vec();
+            let mut left_i_vec = left_i.to_vec();
+            left_v_vec.extend_from_slice(right_v);
+            left_i_vec.extend_from_slice(right_i);
+            self.buffer_indexer.total_index_size -= self.buffer_indexer.by_order.get(order as usize).unwrap().1;
+            self.buffer_indexer.by_position.remove(&position);
+            self.raw_buffer.num_indices -= self.buffer_indexer.by_order.get(order as usize).unwrap().1;
+            self.buffer_indexer.by_order.remove(order as usize);
+            self.raw_buffer.index_buffer = left_i_vec;
+            self.raw_buffer.vertex_buffer = left_v_vec;
+
+            for i in order as usize..self.buffer_indexer.by_position.len() {
+                println!("{:?}", i);
+                println!("{:?}", &self.buffer_indexer.by_order[i].0);
+                println!("{:?}", self.buffer_indexer.by_position.get(&self.buffer_indexer.by_order[i].0).unwrap().0);
+                self.buffer_indexer.by_position.get_mut(&self.buffer_indexer.by_order[i].0).unwrap().0 = i as u32;
+                for mut j in self.raw_buffer.index_buffer.iter_mut()
+                {
+                    j = &mut j.sub(vertex_size);
+                }
+            }
+
+            self.submit_buffer();
+        }
+    }
+
+    fn submit_buffer(&mut self)
+    {
+        //turn raw into buffer
         let mut vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&*vertex_vector),
+            contents: bytemuck::cast_slice(&self.raw_buffer.vertex_buffer),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let mut index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&*index_vector),
+            contents: bytemuck::cast_slice(&self.raw_buffer.index_buffer),
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        //submit buffer to renderer
         self.calculated_buffer = MeshBuffer
         {
             vertex_buffer,
             index_buffer,
-            num_indices: index_vector.len() as u32,
+            num_indices: self.raw_buffer.num_indices,
         }
     }
 
@@ -574,6 +626,13 @@ pub async fn run() {
     let mut last_render_time = instant::Instant::now();
     state.world.generate_chunk(Vector3::new(0, 0, 0));
     state.rebuild_chunk(Vector3::new(0, 0, 0));
+    state.world.generate_chunk(Vector3::new(0, 1, 0));
+    state.rebuild_chunk(Vector3::new(0, 1, 0));
+    state.world.generate_chunk(Vector3::new(0, 1, 1));
+    state.rebuild_chunk(Vector3::new(0, 1, 1));
+    state.world.generate_chunk(Vector3::new(1, 3, 1));
+    state.rebuild_chunk(Vector3::new(1, 3, 1));
+    state.unload_chunk(Vector3::new(0, 0, 0));
 
     window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_e| window.set_cursor_grab(CursorGrabMode::Confined)).unwrap();
     window.set_cursor_visible(false);
