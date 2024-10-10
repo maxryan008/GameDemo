@@ -83,6 +83,7 @@ pub struct CameraController {
     amount_down: f32,
     rotate_horizontal: f32,
     rotate_vertical: f32,
+    pub amount_l_pressed: f32,
     scroll: f32,
     speed: f32,
     sensitivity: f32,
@@ -99,6 +100,7 @@ impl CameraController {
             amount_down: 0.0,
             rotate_horizontal: 0.0,
             rotate_vertical: 0.0,
+            amount_l_pressed: 0.0,
             scroll: 0.0,
             speed,
             sensitivity,
@@ -134,6 +136,10 @@ impl CameraController {
             }
             KeyCode::ShiftLeft => {
                 self.amount_down = amount;
+                true
+            }
+            KeyCode::KeyL => {
+                self.amount_l_pressed = amount;
                 true
             }
             _ => false,

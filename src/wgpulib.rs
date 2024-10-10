@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::iter;
-use std::ops::Sub;
+use std::ops::Add;
+use std::time::Duration;
 use cgmath::prelude::*;
 use cgmath::Vector3;
-use log::logger;
-use wgpu::{Device, Queue};
-use wgpu::naga::TypeInner::Vector;
+use wgpu::{Buffer, Device};
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -16,67 +15,68 @@ use winit::{
 use winit::window::CursorGrabMode;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-use crate::{camera, logger, vertex_types, voxels, world_generation};
+use crate::{camera, logger, timeit, vertex_types, world_generation};
 use crate::texture;
 use crate::vertex_types::{Vertex, WorldMeshVertex};
+use crate::world_generation::ChunkRaw;
 
-const CULL_BACK_FACE: bool = false;
+const CULL_BACK_FACE: bool = true;
+
+struct ChunkInstance {
+    position: cgmath::Vector3<i32>,
+    rotation: cgmath::Quaternion<f32>,
+}
+impl ChunkInstance {
+    fn to_raw(&self) -> ChunkInstanceRaw {
+        ChunkInstanceRaw {
+            model: (cgmath::Matrix4::from_translation(Vector3::new(self.position.x as f32, self.position.y as f32, self.position.z as f32)) * cgmath::Matrix4::from(self.rotation)).into(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChunkInstanceRaw {
+    model: [[f32; 4]; 4],
+}
+
+impl ChunkInstanceRaw {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<ChunkInstanceRaw>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_position: [f32; 4],
     view_proj: [[f32; 4]; 4],
-}
-
-struct MeshBuffer {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
-}
-
-struct MeshBufferRaw {
-    vertex_buffer: Vec<WorldMeshVertex>,
-    index_buffer: Vec<u32>,
-    num_indices: u32,
-}
-
-impl MeshBuffer {
-    fn new(device: &Device) -> Self {
-        MeshBuffer
-        {
-            vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: &*vec![],
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            index_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: &*vec![],
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            num_indices: 0,
-        }
-    }
-}
-
-impl MeshBufferRaw {
-    pub fn new() -> Self {
-        MeshBufferRaw
-        {
-            num_indices: 0,
-            vertex_buffer: vec![],
-            index_buffer: vec![],
-        }
-    }
-}
-
-struct BufferIndexer {
-    //position key, u32 as order, u32 as size, u32 as vertex size
-    by_position: HashMap<Vector3<u32>, (u32, u32, u32)>,
-    //order key, position value, u32 as size, u32 as vertex size
-    by_order: Vec<(Vector3<u32>, u32, u32)>,
-    total_index_size: u32,
 }
 
 impl CameraUniform {
@@ -92,17 +92,44 @@ impl CameraUniform {
     }
 }
 
+struct Queue<T> {
+    queue: Vec<T>,
+}
+
+impl<T> Queue<T> {
+    fn new() -> Self {
+        Queue { queue: Vec::new() }
+    }
+
+    fn enqueue(&mut self, item: T) {
+        self.queue.push(item)
+    }
+
+    fn dequeue(&mut self) -> T {
+        self.queue.remove(0)
+    }
+
+    fn length(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn peek(&self) -> Option<&T> {
+        self.queue.first()
+    }
+}
+
 struct State<'a> {
     window: &'a Window,
     surface: wgpu::Surface<'a>,
-    device: wgpu::Device,
+    device: Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline,
-    calculated_buffer: MeshBuffer,
-    raw_buffer: MeshBufferRaw,
-    buffer_indexer: BufferIndexer,
+    render_pipelines: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     camera: camera::Camera,
     projection: camera::Projection,
     camera_controller: camera::CameraController,
@@ -115,23 +142,26 @@ struct State<'a> {
     depth_texture: texture::Texture,
     mouse_pressed: bool,
     world: world_generation::World,
+    opaque_mesh_buffer: HashMap<Vector3<i32>, (Buffer, Buffer, Buffer, u32)>,
+    opaque_mesh_queue: Queue<ChunkRaw>,
 }
 
 fn create_render_pipeline(
-    device: &wgpu::Device,
+    device: &Device,
     layout: &wgpu::PipelineLayout,
     color_format: wgpu::TextureFormat,
     depth_format: Option<wgpu::TextureFormat>,
     vertex_layouts: &[wgpu::VertexBufferLayout],
     shader: wgpu::ShaderModuleDescriptor,
+    polygon_mode: wgpu::PolygonMode,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(shader);
-    let cullface;
+    let cull_face;
     if CULL_BACK_FACE
     {
-        cullface = Some(wgpu::Face::Back);
+        cull_face = Some(wgpu::Face::Back);
     } else {
-        cullface = None
+        cull_face = None;
     }
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(&format!("{:?}", shader)),
@@ -157,8 +187,8 @@ fn create_render_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: cullface,
-            polygon_mode: wgpu::PolygonMode::Fill,
+            cull_mode: cull_face,
+            polygon_mode,
             unclipped_depth: false,
             conservative: false,
         },
@@ -205,7 +235,7 @@ impl<'a> State<'a> {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::POLYGON_MODE_LINE,
                     required_limits: if cfg!(target_arch = "wasm32") {
                         wgpu::Limits::downlevel_webgl2_defaults()
                     } else {
@@ -282,7 +312,7 @@ impl<'a> State<'a> {
         let camera = camera::Camera::new((0.0, 0.0, 1.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
             camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
-        let camera_controller = camera::CameraController::new(100.0, 1.0);
+        let camera_controller = camera::CameraController::new( 20.0, 1.0); //speed
 
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
@@ -330,37 +360,44 @@ impl<'a> State<'a> {
                 push_constant_ranges: &[],
             });
 
-        let render_pipeline = {
+        let render_pipeline_fill = {
             create_render_pipeline(
                 &device,
                 &render_pipeline_layout,
                 config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
-                &[vertex_types::WorldMeshVertex::desc()],
+                &[WorldMeshVertex::desc(), ChunkInstanceRaw::desc()],
                 wgpu::ShaderModuleDescriptor {
                     label: Some("Shader"),
                     source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
                 },
+                wgpu::PolygonMode::Fill,
+            )
+        };
+        let render_pipeline_line = {
+            create_render_pipeline(
+                &device,
+                &render_pipeline_layout,
+                config.format,
+                Some(texture::Texture::DEPTH_FORMAT),
+                &[WorldMeshVertex::desc(), ChunkInstanceRaw::desc()],
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("Shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+                },
+                wgpu::PolygonMode::Line,
             )
         };
 
-        let mut world = world_generation::World::new();
+        let world = world_generation::World::new();
 
-        let calculated_buffer: MeshBuffer = MeshBuffer::new(&device);
-        let raw_buffer: MeshBufferRaw = MeshBufferRaw::new();
-        let buffer_indexer: BufferIndexer = BufferIndexer
-        {
-            by_position: Default::default(),
-            by_order: Default::default(),
-            total_index_size: 0,
-        };
         Self {
             window,
             surface,
             device,
             queue,
             config,
-            render_pipeline,
+            render_pipelines: (render_pipeline_fill, render_pipeline_line),
             camera,
             projection,
             camera_controller,
@@ -369,14 +406,13 @@ impl<'a> State<'a> {
             camera_uniform,
             depth_texture,
             size,
-            calculated_buffer,
-            raw_buffer,
-            buffer_indexer,
             diffuse_texture,
             diffuse_bind_group,
             #[allow(dead_code)]
             mouse_pressed: false,
             world,
+            opaque_mesh_buffer: HashMap::new(),
+            opaque_mesh_queue: Queue::new(),
         }
     }
 
@@ -433,121 +469,51 @@ impl<'a> State<'a> {
         );
     }
 
-    fn rebuild_chunk(&mut self, position: Vector3<u32>) {
-        if self.buffer_indexer.by_position.contains_key(&position) {
-            //rebuilding old chunk
-            let order: u32 = self.buffer_indexer.by_position.get(&position).unwrap().0;
-            let mut indexer: u32 = 0;
-            for i in 0..=order
-            {
-                indexer += self.buffer_indexer.by_order[i as usize].1;
-            }
-            let mut vertexer: u32 = 0;
-            for i in 0..=order
-            {
-                vertexer += self.buffer_indexer.by_order[i as usize].2;
-            }
-            let chunk_raw = self.world.get_raw_chunk(&position,indexer);
-            self.buffer_indexer.total_index_size += chunk_raw.indices.len() as u32 - self.buffer_indexer.by_order.get(order as usize).unwrap().1;
-            self.raw_buffer.num_indices += chunk_raw.indices.len() as u32 - self.buffer_indexer.by_order.get(order as usize).unwrap().1;
-            let (left_v, right_v) = self.raw_buffer.vertex_buffer.split_at(vertexer as usize);
-            let (left_v, _) = left_v.split_at((vertexer - self.buffer_indexer.by_position.get(&position).unwrap().2) as usize);
-            let (left_i, right_i) = self.raw_buffer.index_buffer.split_at(indexer as usize);
-            let (left_i, _) = left_i.split_at((indexer - self.buffer_indexer.by_position.get(&position).unwrap().1) as usize);
-            let mut left_v_vec = left_v.to_vec();
-            let mut left_i_vec = left_i.to_vec();
-            left_v_vec.extend_from_slice(&chunk_raw.vertices);
-            left_i_vec.extend_from_slice(&chunk_raw.indices);
-            left_v_vec.extend_from_slice(right_v);
-            left_i_vec.extend_from_slice(right_i);
-            self.buffer_indexer.by_position.remove(&position);
-            self.buffer_indexer.by_position.insert(position,(order, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
-            self.buffer_indexer.by_order.remove(order as usize);
-            self.buffer_indexer.by_order.insert(order as usize,(position, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
-            self.raw_buffer.index_buffer = left_i_vec;
-            self.raw_buffer.vertex_buffer = left_v_vec;
-        }else {
-            //building new chunk
-            let order: u32 = self.buffer_indexer.by_position.len() as u32;
-            let chunk_raw = self.world.get_raw_chunk(&position,self.buffer_indexer.total_index_size);
-            self.buffer_indexer.by_position.insert(position,(order, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
-            self.buffer_indexer.by_order.insert(order as usize,(position, chunk_raw.indices.len() as u32, chunk_raw.vertices.len() as u32));
-            self.buffer_indexer.total_index_size += chunk_raw.indices.len() as u32;
-            self.raw_buffer.num_indices += chunk_raw.indices.len() as u32;
-            self.raw_buffer.index_buffer.extend(&chunk_raw.indices);
-            self.raw_buffer.vertex_buffer.extend(&chunk_raw.vertices);
-        }
-
-        self.submit_buffer();
-    }
-
-    fn unload_chunk(&mut self, position: Vector3<u32>)
+    fn unload_chunk(&mut self, position: Vector3<i32>)
     {
-        if self.buffer_indexer.by_position.contains_key(&position) {
-            let order: u32 = self.buffer_indexer.by_position.get(&position).unwrap().0;
-            let mut indexer: u32 = 0;
-            for i in 0..=order
-            {
-                indexer += self.buffer_indexer.by_order[i as usize].1;
-            }
-            let mut vertexer: u32 = 0;
-            for i in 0..=order
-            {
-                vertexer += self.buffer_indexer.by_order[i as usize].2;
-            }
-            let index_size = self.buffer_indexer.by_position.get(&position).unwrap().1;
-            let vertex_size = self.buffer_indexer.by_position.get(&position).unwrap().2;
-            let (left_v, right_v) = self.raw_buffer.vertex_buffer.split_at(vertexer as usize);
-            let (left_v, _) = left_v.split_at((vertexer - self.buffer_indexer.by_position.get(&position).unwrap().2) as usize);
-            let (left_i, right_i) = self.raw_buffer.index_buffer.split_at(indexer as usize);
-            let (left_i, _) = left_i.split_at((indexer - self.buffer_indexer.by_position.get(&position).unwrap().1) as usize);
-            let mut left_v_vec = left_v.to_vec();
-            let mut left_i_vec = left_i.to_vec();
-            left_v_vec.extend_from_slice(right_v);
-            left_i_vec.extend_from_slice(right_i);
-            self.buffer_indexer.total_index_size -= self.buffer_indexer.by_order.get(order as usize).unwrap().1;
-            self.buffer_indexer.by_position.remove(&position);
-            self.raw_buffer.num_indices -= self.buffer_indexer.by_order.get(order as usize).unwrap().1;
-            self.buffer_indexer.by_order.remove(order as usize);
-            self.raw_buffer.index_buffer = left_i_vec;
-            self.raw_buffer.vertex_buffer = left_v_vec;
-
-            for i in order as usize..self.buffer_indexer.by_position.len() {
-                println!("{:?}", i);
-                println!("{:?}", &self.buffer_indexer.by_order[i].0);
-                println!("{:?}", self.buffer_indexer.by_position.get(&self.buffer_indexer.by_order[i].0).unwrap().0);
-                self.buffer_indexer.by_position.get_mut(&self.buffer_indexer.by_order[i].0).unwrap().0 = i as u32;
-                for mut j in self.raw_buffer.index_buffer.iter_mut()
-                {
-                    j = &mut j.sub(vertex_size);
-                }
-            }
-
-            self.submit_buffer();
+        logger::log_raw("Unloaded chunk at ", position);
+        if self.world.chunks.contains_key(&position)
+        {
+            self.world.chunks.remove(&position);
         }
     }
 
-    fn submit_buffer(&mut self)
+    fn update_chunk(&mut self, position: Vector3<i32>)
     {
-        //turn raw into buffer
-        let mut vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let raw_chunk = self.world.chunks.get(&position).unwrap().to_raw_opaque(&self.world.voxel_vector);
+        if self.opaque_mesh_buffer.contains_key(&position)
+        {
+            self.opaque_mesh_buffer.remove(&position);
+        }
+        let position = Vector3::new(position.x * world_generation::CHUNK_SIZE as i32, position.y * world_generation::CHUNK_SIZE as i32, position.z * world_generation::CHUNK_SIZE as i32);
+        let rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0));
+        let chunk_instance = ChunkInstance {
+            position, rotation,
+        };
+        let instance_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&*vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>()),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&self.raw_buffer.vertex_buffer),
+            contents: bytemuck::cast_slice(&raw_chunk.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let mut index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&self.raw_buffer.index_buffer),
+            contents: bytemuck::cast_slice(&raw_chunk.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        self.opaque_mesh_buffer.insert(position, (instance_buffer, vertex_buffer, index_buffer, raw_chunk.indices.len() as u32));
+    }
 
-        //submit buffer to renderer
-        self.calculated_buffer = MeshBuffer
-        {
-            vertex_buffer,
-            index_buffer,
-            num_indices: self.raw_buffer.num_indices,
-        }
+    fn load_chunk(&mut self, position: Vector3<i32>)
+    {
+        self.world.generate_chunk(position);
+        self.update_chunk(position);
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -590,12 +556,26 @@ impl<'a> State<'a> {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            if self.camera_controller.amount_l_pressed > 0.0
+            {
+                render_pass.set_pipeline(&self.render_pipelines.1);
+            } else {
+                render_pass.set_pipeline(&self.render_pipelines.0);
+            }
+
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.calculated_buffer.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.calculated_buffer.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.calculated_buffer.num_indices, 0, 0..1);
+            let mut total_triangles: u32 = 0;
+
+            for (position, (instance_buffer, vertex_buffer, index_buffer, index_size)) in &self.opaque_mesh_buffer
+            {
+                total_triangles = total_triangles + index_size;
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..*index_size, 0, 0..1);
+            }
+            println!("{:?}", total_triangles);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
@@ -609,7 +589,7 @@ pub async fn run() {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
             std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Info).expect("Could't initialize logger");
+            console_log::init_with_level(log::Level::Info).expect("Couldn't initialize logger");
         } else {
             env_logger::init();
         }
@@ -624,15 +604,16 @@ pub async fn run() {
 
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = instant::Instant::now();
-    state.world.generate_chunk(Vector3::new(0, 0, 0));
-    state.rebuild_chunk(Vector3::new(0, 0, 0));
-    state.world.generate_chunk(Vector3::new(0, 1, 0));
-    state.rebuild_chunk(Vector3::new(0, 1, 0));
-    state.world.generate_chunk(Vector3::new(0, 1, 1));
-    state.rebuild_chunk(Vector3::new(0, 1, 1));
-    state.world.generate_chunk(Vector3::new(1, 3, 1));
-    state.rebuild_chunk(Vector3::new(1, 3, 1));
-    state.unload_chunk(Vector3::new(0, 0, 0));
+    for x in 0..10
+    {
+        for y in 0..1
+        {
+            for z in 0..10
+            {
+                state.load_chunk(Vector3::new(x, y, z));
+            }
+        }
+    }
 
     window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_e| window.set_cursor_grab(CursorGrabMode::Confined)).unwrap();
     window.set_cursor_visible(false);
@@ -669,6 +650,8 @@ pub async fn run() {
                         let now = instant::Instant::now();
                         let dt = now - last_render_time;
                         last_render_time = now;
+                        //fps counter sort of
+                        //println!("{:?}", 1000000/dt.as_micros());
                         state.update(dt);
                         match state.render() {
                             Ok(_) => {}

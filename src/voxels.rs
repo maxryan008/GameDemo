@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::iter::Map;
 use image::Rgba;
 use crate::logger;
 
@@ -8,6 +6,7 @@ pub struct VoxelType
 {
     pub name: String,
     pub texture: TexturePattern,
+    pub translucent: bool,
     pub tint: [f32; 3],
 }
 
@@ -18,9 +17,9 @@ pub struct VoxelVector
 
 impl VoxelVector
 {
-    pub fn create(&mut self, id: u8, name: &str, tint: [f32; 3], pattern: TexturePattern)
+    pub fn create(&mut self, id: u8, name: &str, tint: [f32; 3], translucent: bool, pattern: TexturePattern)
     {
-        self.voxels.insert(id, VoxelType::new(name.to_string(), pattern, tint));
+        self.voxels.insert(id, VoxelType::new(name.to_string(), pattern, tint, translucent));
     }
 
     pub fn new() -> Self
@@ -32,11 +31,12 @@ impl VoxelVector
 impl VoxelType
 {
     //texture 4x4 pixels
-    pub fn new(name: String, pattern: TexturePattern, tint: [f32; 3],) -> Self
+    pub fn new(name: String, pattern: TexturePattern, tint: [f32; 3], translucent: bool) -> Self
     {
         VoxelType
         {
             name,
+            translucent,
             texture: pattern,
             tint,
         }
@@ -64,10 +64,10 @@ pub fn initialize() -> VoxelVector
     logger::log("Initializing voxels");
     let mut voxels: VoxelVector = VoxelVector::new();
 
-    voxels.create(0, "red", [1.0, 0.0, 0.0], TexturePattern::new([1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1]));
-    voxels.create(1, "blue", [0.0, 0.0, 1.0], TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
-    voxels.create(2, "green", [0.0, 1.0, 0.0], TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
-    voxels.create(3, "purple", [1.0, 0.0, 1.0], TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
+    voxels.create(0, "red", [1.0, 0.0, 0.0], false, TexturePattern::new([1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1],[1, 0, 0, 1]));
+    voxels.create(1, "blue", [0.0, 0.0, 1.0], false, TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
+    voxels.create(2, "green", [0.0, 1.0, 0.0], false, TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
+    voxels.create(3, "purple", [1.0, 0.0, 1.0], true, TexturePattern::new([0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1],[0, 0, 1, 1]));
 
     voxels
 }

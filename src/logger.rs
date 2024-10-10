@@ -1,20 +1,24 @@
 use cgmath::Vector3;
 use crate::voxels::VoxelVector;
-use crate::world_generation::World;
 
 pub fn log(record: &str)
 {
     println!("GameDemo: {}", record);
 }
 
+pub fn log_raw(record: &str, value: Vector3<i32>)
+{
+    println!("GameDemo: {}{:?}", record, value);
+}
+
 pub fn log_voxel_types(record: VoxelVector)
 {
-    for voxelType in record.voxels
+    for voxel_type in record.voxels
     {
-        println!("Id: {} - Name: {}", voxelType.0, voxelType.1.name);
+        println!("Id: {} - Name: {}", voxel_type.0, voxel_type.1.name);
     }
 }
 
-pub fn log_chunk(position: Vector3<u32>) {
+pub fn log_chunk(position: Vector3<i32>) {
     println!("GameDemo: Generating new chunk at {:?}", position);
 }
