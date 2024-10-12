@@ -1,9 +1,13 @@
 use std::collections::HashMap;
-use std::iter;
+use std::{iter, thread};
 use std::ops::Add;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use cgmath::prelude::*;
-use cgmath::Vector3;
+use std::sync::mpsc;
+use cgmath::{Vector2, Vector3};
+use image::{Rgba, RgbaImage};
+use rand::{thread_rng, Rng};
 use wgpu::{Buffer, Device};
 use wgpu::util::DeviceExt;
 use winit::{
@@ -15,10 +19,13 @@ use winit::{
 use winit::window::CursorGrabMode;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-use crate::{camera, logger, timeit, vertex_types, world_generation};
+use crate::{camera, logger, texture_packer, timeit, vertex_types, voxels, world_handler};
 use crate::texture;
+use crate::texture::Texture;
+use crate::texture_packer::find_optimal_atlas_size;
 use crate::vertex_types::{Vertex, WorldMeshVertex};
-use crate::world_generation::ChunkRaw;
+use crate::voxels::{TexturePattern, VoxelVector};
+use crate::world_handler::{ArcQueue, Queue, Worker, CHUNK_SIZE};
 
 const CULL_BACK_FACE: bool = true;
 
@@ -36,7 +43,7 @@ impl ChunkInstance {
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ChunkInstanceRaw {
+pub struct ChunkInstanceRaw {
     model: [[f32; 4]; 4],
 }
 
@@ -92,36 +99,6 @@ impl CameraUniform {
     }
 }
 
-struct Queue<T> {
-    queue: Vec<T>,
-}
-
-impl<T> Queue<T> {
-    fn new() -> Self {
-        Queue { queue: Vec::new() }
-    }
-
-    fn enqueue(&mut self, item: T) {
-        self.queue.push(item)
-    }
-
-    fn dequeue(&mut self) -> T {
-        self.queue.remove(0)
-    }
-
-    fn length(&self) -> usize {
-        self.queue.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    fn peek(&self) -> Option<&T> {
-        self.queue.first()
-    }
-}
-
 struct State<'a> {
     window: &'a Window,
     surface: wgpu::Surface<'a>,
@@ -141,9 +118,14 @@ struct State<'a> {
     #[allow(dead_code)]
     depth_texture: texture::Texture,
     mouse_pressed: bool,
-    world: world_generation::World,
+    //world: world_generation::World,
+    atlas: RgbaImage,
+
+    voxel_vector: Arc<voxels::VoxelVector>,
+    texture_map: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>>,
     opaque_mesh_buffer: HashMap<Vector3<i32>, (Buffer, Buffer, Buffer, u32)>,
-    opaque_mesh_queue: Queue<ChunkRaw>,
+    mesh_workers: Vec<Worker<world_handler::Chunk>>,
+    mesh_result_queue: ArcQueue<(Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw))>,
 }
 
 fn create_render_pipeline(
@@ -266,10 +248,46 @@ impl<'a> State<'a> {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        //let world = world_generation::World::new();
 
-        let diffuse_bytes = include_bytes!("happy-tree.png");
+        let mut rng = thread_rng();
+        let voxels = voxels::initialize();
+        let mut images: Vec<(u8, RgbaImage)> = Vec::new();
+        for voxel in voxels.voxels.iter().clone() {
+            let id = voxel.0.clone();
+            let voxel_type = voxel.1;
+            let variants = voxel_type.variants;
+            if variants == 1 {
+                let texture = Texture::from_rgba(&voxel_type.texture, 4, 4);
+                images.push((id, texture));
+            } else {
+                let texture = Texture::from_rgba(&voxel_type.texture, 4, 4);
+                images.push((id, texture));
+                for i in 1..=variants
+                {
+                    let mut variant_pattern: Vec<Rgba<u8>> = voxel_type.texture.pattern.clone();
+                    let pos1 = rng.gen_range(0..variant_pattern.len());
+                    let pos2 = rng.gen_range(0..variant_pattern.len()-1);
+                    let pos3 = rng.gen_range(0..variant_pattern.len()-2);
+                    let pos4 = rng.gen_range(0..variant_pattern.len()-2);
+                    let pos5 = rng.gen_range(0..variant_pattern.len()-1);
+                    let pos6 = rng.gen_range(0..variant_pattern.len());
+                    let pixel1 = variant_pattern.remove(pos1);
+                    let pixel2 = variant_pattern.remove(pos2);
+                    let pixel3 = variant_pattern.remove(pos3);
+                    variant_pattern.insert(pos4, pixel1);
+                    variant_pattern.insert(pos5, pixel2);
+                    variant_pattern.insert(pos6, pixel3);
+                    let texture = Texture::from_rgba(&TexturePattern::from_vec(variant_pattern), 4, 4);
+                    images.push((id, texture));
+                }
+            }
+        }
+        let (atlas, texture_map) = find_optimal_atlas_size(images);
+        atlas.save("texture_atlas.png").unwrap();
+
         let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png", false).unwrap();
+            Texture::from_rgba_image(&device, &queue, &atlas, "atlas.png".into(), false).unwrap();
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -389,7 +407,35 @@ impl<'a> State<'a> {
             )
         };
 
-        let world = world_generation::World::new();
+        let voxel_vector = Arc::new(voxels);
+
+        let atlas_data: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>> = Arc::new(texture_map);
+
+        let mut mesh_workers = Vec::new();
+        let arc_queue = ArcQueue::new();
+        let result_queue: ArcQueue<(Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw))> = ArcQueue::new();
+        for _ in 0..5 {
+            mesh_workers.push(Worker::new(
+                arc_queue.clone(),
+                |item: world_handler::Chunk, voxel_vector: Arc<voxels::VoxelVector>, atlas_data: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>>| -> (Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw)) {
+                    let raw_chunk = item.to_raw_opaque(voxel_vector, atlas_data);
+                    let position = Vector3::new(
+                        item.position.x * CHUNK_SIZE as i32,
+                        item.position.y * CHUNK_SIZE as i32,
+                        item.position.z * CHUNK_SIZE as i32
+                    );
+                    let chunk_instance = ChunkInstance {
+                        position,
+                        rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
+                    };
+                    let binding = vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>();
+                    return (item.position, (binding, raw_chunk));
+                },
+                voxel_vector.clone(),
+                atlas_data.clone(),
+                result_queue.clone()
+            ));
+        }
 
         Self {
             window,
@@ -405,14 +451,18 @@ impl<'a> State<'a> {
             camera_bind_group,
             camera_uniform,
             depth_texture,
+            atlas,
             size,
             diffuse_texture,
             diffuse_bind_group,
             #[allow(dead_code)]
             mouse_pressed: false,
-            world,
+            //world,
+            mesh_result_queue: result_queue,
             opaque_mesh_buffer: HashMap::new(),
-            opaque_mesh_queue: Queue::new(),
+            mesh_workers,
+            texture_map: atlas_data,
+            voxel_vector,
         }
     }
 
@@ -467,20 +517,63 @@ impl<'a> State<'a> {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
+        if let Some(result) = self.mesh_result_queue.dequeue() {
+            let (position, (raw_instance, raw_chunk)) = result;
+            if self.opaque_mesh_buffer.contains_key(&position) {
+                let buffers = self.opaque_mesh_buffer.get(&result.0).unwrap();
+                self.queue.write_buffer(
+                    &buffers.0,
+                    0,
+                    bytemuck::cast_slice(&raw_instance),
+                );
+                self.queue.write_buffer(
+                    &buffers.1,
+                    0,
+                    bytemuck::cast_slice(&raw_chunk.vertices),
+                );
+                self.queue.write_buffer(
+                    &buffers.2,
+                    0,
+                    bytemuck::cast_slice(&raw_chunk.indices),
+                );
+            } else {
+                let instance_buffer = self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("Instance Buffer"),
+                        contents: bytemuck::cast_slice(&raw_instance),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }
+                );
+                let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&raw_chunk.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Index Buffer"),
+                    contents:  bytemuck::cast_slice(&raw_chunk.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                self.opaque_mesh_buffer.insert(position, (instance_buffer, vertex_buffer, index_buffer, raw_chunk.indices.len() as u32));
+            }
+        }
     }
 
     fn unload_chunk(&mut self, position: Vector3<i32>)
     {
+        /*
         logger::log_raw("Unloaded chunk at ", position);
         if self.world.chunks.contains_key(&position)
         {
             self.world.chunks.remove(&position);
         }
+        */
     }
 
     fn update_chunk(&mut self, position: Vector3<i32>)
     {
-        let raw_chunk = self.world.chunks.get(&position).unwrap().to_raw_opaque(&self.world.voxel_vector);
+        /*
+        let raw_chunk = self.world.chunks.get(&position).unwrap().to_raw_opaque(&self.world.voxel_vector, &self.texture_map);
         if self.opaque_mesh_buffer.contains_key(&position)
         {
             self.opaque_mesh_buffer.remove(&position);
@@ -490,30 +583,36 @@ impl<'a> State<'a> {
         let chunk_instance = ChunkInstance {
             position, rotation,
         };
+        let t1 = bytemuck::cast_slice(&*vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>());
         let instance_buffer = self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Instance Buffer"),
-                contents: bytemuck::cast_slice(&*vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>()),
+                contents: t1,
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
+        let t2 = bytemuck::cast_slice(&raw_chunk.vertices);
         let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&raw_chunk.vertices),
+            contents: t2,
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let t3 = bytemuck::cast_slice(&raw_chunk.indices);
         let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&raw_chunk.indices),
+            contents: t3,
             usage: wgpu::BufferUsages::INDEX,
         });
         self.opaque_mesh_buffer.insert(position, (instance_buffer, vertex_buffer, index_buffer, raw_chunk.indices.len() as u32));
+        */
     }
 
     fn load_chunk(&mut self, position: Vector3<i32>)
     {
-        self.world.generate_chunk(position);
+        self.mesh_workers.get(0).unwrap().enqueue(world_handler::Chunk::new(position));
+        /*
         self.update_chunk(position);
+        */
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -575,7 +674,7 @@ impl<'a> State<'a> {
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..*index_size, 0, 0..1);
             }
-            println!("{:?}", total_triangles);
+            //println!("{:?}", total_triangles);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
@@ -604,11 +703,11 @@ pub async fn run() {
 
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = instant::Instant::now();
-    for x in 0..10
+    for x in 0..15
     {
         for y in 0..1
         {
-            for z in 0..10
+            for z in 0..15
             {
                 state.load_chunk(Vector3::new(x, y, z));
             }

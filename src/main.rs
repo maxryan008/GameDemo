@@ -2,9 +2,10 @@ mod wgpulib;
 mod texture;
 mod camera;
 mod vertex_types;
-mod world_generation;
 mod voxels;
 mod logger;
+mod texture_packer;
+mod world_handler;
 
 use std::time::{Duration, SystemTime};
 use wgpulib::run;
