@@ -705,48 +705,6 @@ impl<'a> State<'a> {
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..*index_size, 0, 0..1);
             }
-            let position = Vector3::zero();
-            let chunk_instance = ChunkInstance {
-                position,
-                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
-            };
-            let binding = vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>();
-            let instance_buffer = self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("Instance Buffer"),
-                    contents: bytemuck::cast_slice(&*binding),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }
-            );
-            let t2 = bytemuck::cast_slice(&[WorldMeshVertex{
-                position: [0.0,0.0,0.0],
-                tex_coords: [0.2,0.0],
-                color: [1.0, 1.0, 1.0],
-            },WorldMeshVertex{
-                position: [1.0,0.0,0.0],
-                tex_coords: [0.2,0.0],
-                color: [1.0, 1.0, 1.0],
-            },WorldMeshVertex{
-                position: [1.0,1.0,0.0],
-                tex_coords: [0.2,0.0],
-                color: [1.0, 1.0, 1.0],
-            }]);
-            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: t2,
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let t3 = bytemuck::cast_slice(&[0,1,2]);
-            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: t3,
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..3, 0, 0..1);
-            //println!("Total triangles: {:?}", total_triangles);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
