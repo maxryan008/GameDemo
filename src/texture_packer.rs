@@ -26,12 +26,12 @@ fn calculate_total_area(images: &Vec<RgbaImage>) -> u32 {
 }
 
 fn maxrects_pack(
-    images: Vec<(u8, RgbaImage)>,
+    images: Vec<(u32, RgbaImage)>,
     atlas_width: u32,
     atlas_height: u32
-) -> Option<(RgbaImage, HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>)> {
+) -> Option<(RgbaImage, HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>)> {
     let mut atlas = RgbaImage::new(atlas_width, atlas_height);
-    let mut texture_map: HashMap<u8, (Vec<Vector2<f32>>, f32, f32)> = HashMap::new();
+    let mut texture_map: HashMap<u32, (Vec<Vector2<f32>>, f32, f32)> = HashMap::new();
 
     let mut free_rectangles = vec![Rect { x: 0, y: 0, width: atlas_width, height: atlas_height }];
 
@@ -103,8 +103,8 @@ fn split_free_rectangles(free_rect: Rect, placed_rect: Rect) -> Vec<Rect> {
 }
 
 pub fn find_optimal_atlas_size(
-    images: Vec<(u8, RgbaImage)>
-) -> (RgbaImage, HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>) {
+    images: Vec<(u32, RgbaImage)>
+) -> (RgbaImage, HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>) {
     let total_area = calculate_total_area(&images.iter().map(|(_, img)| img.clone()).collect());
 
     let mut atlas_size = (f32::sqrt(total_area as f32).ceil() as u32).max(128);

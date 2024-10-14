@@ -6,6 +6,12 @@ mod voxels;
 mod logger;
 mod texture_packer;
 mod world_handler;
+mod chunks_refs;
+mod constants;
+mod quad;
+mod face_direction;
+mod greedy_mesher;
+mod lod;
 
 use std::time::{Duration, SystemTime};
 use wgpulib::run;

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use cgmath::prelude::*;
 use std::sync::mpsc;
-use cgmath::{Vector2, Vector3};
+use cgmath::{Quaternion, Vector2, Vector3};
 use image::{Rgba, RgbaImage};
 use rand::{thread_rng, Rng};
 use wgpu::{Buffer, Device};
@@ -20,21 +20,23 @@ use winit::window::CursorGrabMode;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use crate::{camera, logger, texture_packer, timeit, vertex_types, voxels, world_handler};
+use crate::constants::CHUNK_SIZE;
+use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, WorldData};
 use crate::texture;
 use crate::texture::Texture;
 use crate::texture_packer::find_optimal_atlas_size;
 use crate::vertex_types::{Vertex, WorldMeshVertex};
 use crate::voxels::{TexturePattern, VoxelVector};
-use crate::world_handler::{ArcQueue, Queue, Worker, CHUNK_SIZE};
+use crate::world_handler::{ArcQueue, Queue, DataWorker};
 
-const CULL_BACK_FACE: bool = true;
+const CULL_BACK_FACE: bool = false;
 
-struct ChunkInstance {
-    position: cgmath::Vector3<i32>,
-    rotation: cgmath::Quaternion<f32>,
+pub struct ChunkInstance {
+    pub position: Vector3<i32>,
+    pub rotation: Quaternion<f32>,
 }
 impl ChunkInstance {
-    fn to_raw(&self) -> ChunkInstanceRaw {
+    pub fn to_raw(&self) -> ChunkInstanceRaw {
         ChunkInstanceRaw {
             model: (cgmath::Matrix4::from_translation(Vector3::new(self.position.x as f32, self.position.y as f32, self.position.z as f32)) * cgmath::Matrix4::from(self.rotation)).into(),
         }
@@ -42,7 +44,7 @@ impl ChunkInstance {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, Debug)]
 pub struct ChunkInstanceRaw {
     model: [[f32; 4]; 4],
 }
@@ -118,14 +120,11 @@ struct State<'a> {
     #[allow(dead_code)]
     depth_texture: texture::Texture,
     mouse_pressed: bool,
-    //world: world_generation::World,
+    world_data: WorldData,
     atlas: RgbaImage,
-
     voxel_vector: Arc<voxels::VoxelVector>,
-    texture_map: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>>,
+    texture_map: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
     opaque_mesh_buffer: HashMap<Vector3<i32>, (Buffer, Buffer, Buffer, u32)>,
-    mesh_workers: Vec<Worker<world_handler::Chunk>>,
-    mesh_result_queue: ArcQueue<(Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw))>,
 }
 
 fn create_render_pipeline(
@@ -248,11 +247,11 @@ impl<'a> State<'a> {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        //let world = world_generation::World::new();
+        //let world = world_generation::World::generate();
 
         let mut rng = thread_rng();
         let voxels = voxels::initialize();
-        let mut images: Vec<(u8, RgbaImage)> = Vec::new();
+        let mut images: Vec<(u32, RgbaImage)> = Vec::new();
         for voxel in voxels.voxels.iter().clone() {
             let id = voxel.0.clone();
             let voxel_type = voxel.1;
@@ -409,33 +408,24 @@ impl<'a> State<'a> {
 
         let voxel_vector = Arc::new(voxels);
 
-        let atlas_data: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>> = Arc::new(texture_map);
+        let atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>> = Arc::new(texture_map);
 
-        let mut mesh_workers = Vec::new();
-        let arc_queue = ArcQueue::new();
-        let result_queue: ArcQueue<(Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw))> = ArcQueue::new();
-        for _ in 0..5 {
-            mesh_workers.push(Worker::new(
-                arc_queue.clone(),
-                |item: world_handler::Chunk, voxel_vector: Arc<voxels::VoxelVector>, atlas_data: Arc<HashMap<u8, (Vec<Vector2<f32>>, f32, f32)>>| -> (Vector3<i32>, (Vec<ChunkInstanceRaw>, world_handler::ChunkRaw)) {
-                    let raw_chunk = item.to_raw_opaque(voxel_vector, atlas_data);
-                    let position = Vector3::new(
-                        item.position.x * CHUNK_SIZE as i32,
-                        item.position.y * CHUNK_SIZE as i32,
-                        item.position.z * CHUNK_SIZE as i32
-                    );
-                    let chunk_instance = ChunkInstance {
-                        position,
-                        rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
-                    };
-                    let binding = vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>();
-                    return (item.position, (binding, raw_chunk));
-                },
-                voxel_vector.clone(),
-                atlas_data.clone(),
-                result_queue.clone()
-            ));
-        }
+        let mut world_data: WorldData = WorldData
+        {
+            chunks_data: Arc::new(Mutex::new(HashMap::new())),
+            load_data_queue: ArcQueue::new(),
+            load_mesh_queue: ArcQueue::new(),
+            finished_data_queue: ArcQueue::new(),
+            finished_mesh_queue: ArcQueue::new(),
+            data_workers: Vec::new(),
+            mesh_workers: Vec::new(),
+            chunk_modifications: HashMap::new(),
+        };
+
+        start_data_tasks(&mut world_data, voxel_vector.clone(), atlas_data.clone());
+        start_mesh_tasks(&mut world_data, voxel_vector.clone(), atlas_data.clone());
+
+        let opaque_mesh_buffer = HashMap::new();
 
         Self {
             window,
@@ -457,12 +447,10 @@ impl<'a> State<'a> {
             diffuse_bind_group,
             #[allow(dead_code)]
             mouse_pressed: false,
-            //world,
-            mesh_result_queue: result_queue,
-            opaque_mesh_buffer: HashMap::new(),
-            mesh_workers,
+            world_data,
             texture_map: atlas_data,
             voxel_vector,
+            opaque_mesh_buffer,
         }
     }
 
@@ -517,46 +505,89 @@ impl<'a> State<'a> {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        if let Some(result) = self.mesh_result_queue.dequeue() {
-            let (position, (raw_instance, raw_chunk)) = result;
-            if self.opaque_mesh_buffer.contains_key(&position) {
-                let buffers = self.opaque_mesh_buffer.get(&result.0).unwrap();
-                self.queue.write_buffer(
-                    &buffers.0,
-                    0,
-                    bytemuck::cast_slice(&raw_instance),
-                );
-                self.queue.write_buffer(
-                    &buffers.1,
-                    0,
-                    bytemuck::cast_slice(&raw_chunk.vertices),
-                );
-                self.queue.write_buffer(
-                    &buffers.2,
-                    0,
-                    bytemuck::cast_slice(&raw_chunk.indices),
-                );
-            } else {
+        if let Some(result) = self.world_data.finished_data_queue.dequeue()
+        {
+            if let Ok(mut chunks_data) = self.world_data.chunks_data.lock() {
+                chunks_data.insert(result.0, Arc::new(result.1.clone()));
+            }
+            self.world_data.load_mesh_queue.enqueue(result.0);
+        }
+        //println!("finished chunks: {:?}", self.world_data.finished_mesh_queue.length());
+        if let Some(result) = self.world_data.finished_mesh_queue.dequeue() {
+            let (position, chunk_mesh) = result;
+            if let Some(chunk_mesh_result) = chunk_mesh
+            {
                 let instance_buffer = self.device.create_buffer_init(
                     &wgpu::util::BufferInitDescriptor {
                         label: Some("Instance Buffer"),
-                        contents: bytemuck::cast_slice(&raw_instance),
+                        contents: &chunk_mesh_result.instance.as_slice(),
                         usage: wgpu::BufferUsages::VERTEX,
                     }
                 );
                 let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&raw_chunk.vertices),
+                    contents: bytemuck::cast_slice(&chunk_mesh_result.vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
                 let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Index Buffer"),
-                    contents:  bytemuck::cast_slice(&raw_chunk.indices),
+                    contents:  bytemuck::cast_slice(&chunk_mesh_result.indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
-                self.opaque_mesh_buffer.insert(position, (instance_buffer, vertex_buffer, index_buffer, raw_chunk.indices.len() as u32));
+                self.opaque_mesh_buffer.insert(position,(instance_buffer, vertex_buffer, index_buffer, chunk_mesh_result.indices.len() as u32));
+                println!("vertices: {:?}", chunk_mesh_result.vertices.iter().map(|x| x.position).collect::<Vec<_>>());
+                println!("indices: {:?}", chunk_mesh_result.indices);
+                //println!("{:?}", chunk_mesh_result.indices.len());
             }
         }
+        // if let Some(result) = self.world_data.finished_mesh_queue.dequeue() {
+        //     //println!("{:?}", result);
+        //     let (position, chunk_mesh) = result;
+        //     if let Some(chunk_mesh_result) = chunk_mesh
+        //     {
+        //         //println!("RENDERING CHUNK");
+        //         if self.opaque_mesh_buffer.contains_key(&position) {
+        //             let buffers = self.opaque_mesh_buffer.get(&result.0).unwrap();
+        //             self.queue.write_buffer(
+        //                 &buffers.0,
+        //                 0,
+        //                 bytemuck::cast_slice(&chunk_mesh_result.instance),
+        //             );
+        //             self.queue.write_buffer(
+        //                 &buffers.1,
+        //                 0,
+        //                 chunk_mesh_result.vertices.as_slice(),
+        //             );
+        //             self.queue.write_buffer(
+        //                 &buffers.2,
+        //                 0,
+        //                 chunk_mesh_result.indices.as_slice(),
+        //             );
+        //         } else {
+        //             let instance_buffer = self.device.create_buffer_init(
+        //                 &wgpu::util::BufferInitDescriptor {
+        //                     label: Some("Instance Buffer"),
+        //                     contents: bytemuck::cast_slice(&chunk_mesh_result.instance),
+        //                     usage: wgpu::BufferUsages::VERTEX,
+        //                 }
+        //             );
+        //             let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //                 label: Some("Vertex Buffer"),
+        //                 contents: bytemuck::cast_slice(&chunk_mesh_result.vertices),
+        //                 usage: wgpu::BufferUsages::VERTEX,
+        //             });
+        //             let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //                 label: Some("Index Buffer"),
+        //                 contents:  bytemuck::cast_slice(&chunk_mesh_result.indices),
+        //                 usage: wgpu::BufferUsages::INDEX,
+        //             });
+        //             self.opaque_mesh_buffer.insert(position, (instance_buffer, vertex_buffer, index_buffer, chunk_mesh_result.indices.len() as u32));
+        //             println!("{:?}", chunk_mesh_result.vertices);
+        //             println!("{:?}", chunk_mesh_result.indices);
+        //             println!("{:?}", chunk_mesh_result.indices.len());
+        //         }
+        //     }
+        // }
     }
 
     fn unload_chunk(&mut self, position: Vector3<i32>)
@@ -578,12 +609,12 @@ impl<'a> State<'a> {
         {
             self.opaque_mesh_buffer.remove(&position);
         }
-        let position = Vector3::new(position.x * world_generation::CHUNK_SIZE as i32, position.y * world_generation::CHUNK_SIZE as i32, position.z * world_generation::CHUNK_SIZE as i32);
+        let position = Vector3::generate(position.x * world_generation::CHUNK_SIZE as i32, position.y * world_generation::CHUNK_SIZE as i32, position.z * world_generation::CHUNK_SIZE as i32);
         let rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0));
         let chunk_instance = ChunkInstance {
             position, rotation,
         };
-        let t1 = bytemuck::cast_slice(&*vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>());
+         let t1 = bytemuck::cast_slice(&*vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>());
         let instance_buffer = self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Instance Buffer"),
@@ -609,7 +640,7 @@ impl<'a> State<'a> {
 
     fn load_chunk(&mut self, position: Vector3<i32>)
     {
-        self.mesh_workers.get(0).unwrap().enqueue(world_handler::Chunk::new(position));
+        self.world_data.load_data_queue.enqueue(position);
         /*
         self.update_chunk(position);
         */
@@ -668,13 +699,54 @@ impl<'a> State<'a> {
 
             for (position, (instance_buffer, vertex_buffer, index_buffer, index_size)) in &self.opaque_mesh_buffer
             {
-                total_triangles = total_triangles + index_size;
+                total_triangles = total_triangles + index_size/3;
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
                 render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..*index_size, 0, 0..1);
             }
-            //println!("{:?}", total_triangles);
+            let position = Vector3::zero();
+            let chunk_instance = ChunkInstance {
+                position,
+                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
+            };
+            let binding = vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>();
+            let instance_buffer = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Instance Buffer"),
+                    contents: bytemuck::cast_slice(&*binding),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }
+            );
+            let t2 = bytemuck::cast_slice(&[WorldMeshVertex{
+                position: [0.0,0.0,0.0],
+                tex_coords: [0.2,0.0],
+                color: [1.0, 1.0, 1.0],
+            },WorldMeshVertex{
+                position: [1.0,0.0,0.0],
+                tex_coords: [0.2,0.0],
+                color: [1.0, 1.0, 1.0],
+            },WorldMeshVertex{
+                position: [1.0,1.0,0.0],
+                tex_coords: [0.2,0.0],
+                color: [1.0, 1.0, 1.0],
+            }]);
+            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: t2,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let t3 = bytemuck::cast_slice(&[0,1,2]);
+            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: t3,
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
+            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..3, 0, 0..1);
+            //println!("Total triangles: {:?}", total_triangles);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
@@ -705,7 +777,7 @@ pub async fn run() {
     let mut last_render_time = instant::Instant::now();
     for x in 0..15
     {
-        for y in 0..1
+        for y in 0..3
         {
             for z in 0..15
             {

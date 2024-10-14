@@ -20,5 +20,5 @@ pub fn log_voxel_types(record: VoxelVector)
 }
 
 pub fn log_chunk(position: Vector3<i32>) {
-    println!("GameDemo: Generating new chunk at {:?}", position);
+    println!("GameDemo: Generating generate chunk at {:?}", position);
 }
