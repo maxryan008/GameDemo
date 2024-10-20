@@ -534,3 +534,12 @@ pub fn get_edging_chunk(pos: Vector3<i32>) -> Option<Vector3<i32>> {
         Some(chunk_dir)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct Rect  {
+    pub vertices: [[f32; 3]; 4], // 4 vertices, each with x, y, z coordinates
+    pub indices: [u32; 6],       // Indices for drawing 2 triangles (6 indices)
+    pub blocks: Vec<u32>,        // List of the blocks that should be displayed on this rect
+    pub tints: Vec<[f32; 3]>,    // List of tints that should be displayed on this rect
+    pub width: u32,
+}
