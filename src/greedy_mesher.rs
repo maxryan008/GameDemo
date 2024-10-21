@@ -542,4 +542,5 @@ pub struct Rect  {
     pub blocks: Vec<u32>,        // List of the blocks that should be displayed on this rect
     pub tints: Vec<[f32; 3]>,    // List of tints that should be displayed on this rect
     pub width: u32,
+    pub height: u32,
 }

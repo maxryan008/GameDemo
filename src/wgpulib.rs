@@ -140,8 +140,8 @@ fn create_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         address_mode_u: wgpu::AddressMode::ClampToEdge, // How to handle out-of-bounds sampling along the U axis
         address_mode_v: wgpu::AddressMode::ClampToEdge, // V axis
         address_mode_w: wgpu::AddressMode::ClampToEdge, // W axis (used for 3D textures)
-        mag_filter: wgpu::FilterMode::Linear, // How to interpolate when magnifying the texture
-        min_filter: wgpu::FilterMode::Linear, // How to interpolate when minifying the texture
+        mag_filter: wgpu::FilterMode::Nearest, // How to interpolate when magnifying the texture
+        min_filter: wgpu::FilterMode::Nearest, // How to interpolate when minifying the texture
         mipmap_filter: wgpu::FilterMode::Nearest, // How to interpolate between mipmap levels
         lod_min_clamp: 0.0, // Level of detail (LOD) min clamp
         lod_max_clamp: 100.0, // LOD max clamp
@@ -753,18 +753,34 @@ pub async fn run() {
     let buffered_chunk = process_raw_chunk(
         RawChunk {
             position: Vector3::new(0, 0, 0),
-            rects: vec![Rect {
-                vertices: [
-                    [0.0,0.0,0.0],
-                    [0.0,2.0,0.0],
-                    [2.0,2.0,0.0],
-                    [2.0,0.0,0.0]
-                ],
-                indices: [0,1,2,2,3,0],
-                blocks: vec![1,2,3,4,5,6,5,4,3],
-                tints: vec![[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]],
-                width: 3,
-            }],
+            rects: vec![
+                Rect {
+                    vertices: [
+                        [0.0,0.0,0.0],
+                        [0.0,2.0,0.0],
+                        [2.0,2.0,0.0],
+                        [2.0,0.0,0.0]
+                    ],
+                    indices: [0,1,2,2,3,0],
+                    blocks: vec![1,2,3,4,5,6,5,4,3],
+                    tints: vec![[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]],
+                    width: 3,
+                    height: 3,
+                },
+                Rect {
+                    vertices: [
+                        [0.0,0.0,20.0],
+                        [20.0,0.0,20.0],
+                        [20.0,0.0,0.0],
+                        [0.0,0.0,0.0]
+                    ],
+                    indices: [0,1,2,2,3,0],
+                    blocks: vec![1,2,3,4,5,6,5,4,3],
+                    tints: vec![[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]],
+                    width: 3,
+                    height: 3,
+                }
+            ],
             atlas: state.atlas.clone(),
             texture_map: state.texture_map.clone(),
         },
@@ -918,6 +934,16 @@ pub fn process_raw_chunk(
     rects_indices_sizes.push(indices_flat.len() as u32);
     rects_blocks_sizes.push(blocks_flat.len() as u32);
     rects_tints_sizes.push(tints_flat.len() as u32);
+
+    //todo make width and height automatic
+    let positions: Vec<[u32;2]> = pack_rects(&raw_chunk.rects, 128, 128);
+
+    // Upload the positions to the GPU
+    let positions_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Rect Positions Buffer"),
+        contents: bytemuck::cast_slice(&positions),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
 
     // Create GPU buffers for the flattened data
     let vertices_flat_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1207,12 +1233,29 @@ pub fn process_raw_chunk(
         label: Some("Compute Bind Group Layout Group 1"),
     });
 
+    let bind_group_layout_group_2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        ],
+        label: Some("Compute Bind Group Layout Group 2"),
+    });
+
     let pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Compute Pipeline Layout"),
             bind_group_layouts: &[
                 &bind_group_layout_group_0,
                 &bind_group_layout_group_1,
+                &bind_group_layout_group_2,
             ],
             push_constant_ranges: &[],
         });
@@ -1310,6 +1353,17 @@ pub fn process_raw_chunk(
         label: Some("Compute Bind Group 1"),
     });
 
+    let bind_group_2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &bind_group_layout_group_2,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: positions_buffer.as_entire_binding(),
+            }
+        ],
+        label: Some("Compute Bind Group 2"),
+    });
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Compute Encoder"),
     });
@@ -1323,6 +1377,7 @@ pub fn process_raw_chunk(
         pass.set_pipeline(&compute_pipeline);
         pass.set_bind_group(0, &bind_group_0, &[]);
         pass.set_bind_group(1, &bind_group_1, &[]);
+        pass.set_bind_group(2, &bind_group_2, &[]);
         pass.dispatch_workgroups(raw_chunk.rects.len() as u32, 1, 1);
     }
 
@@ -1357,4 +1412,44 @@ pub fn process_raw_chunk(
         indices_length: raw_chunk.rects.len() as u32 * 6,
     }
 }
+
+// Function to pack rects and return their top-left positions
+fn pack_rects(rects: &Vec<Rect>, output_width: u32, output_height: u32) -> Vec<[u32; 2]> {
+    let mut placed_positions = Vec::new(); // To store the top-left positions
+    let mut free_areas = vec![RawRect { x: 0, y: 0, width: output_width, height: output_height }];
+
+    for rect in rects.iter() {
+        let mut raw_rect = RawRect {x:0,y:0,width:rect.width, height:rect.height};
+        for i in (0..free_areas.len()).rev() {
+            let free_area = &free_areas[i].clone();
+
+            // Check if the rect fits in the free area
+            if raw_rect.width <= free_area.width && raw_rect.height <= free_area.height {
+                // Place the rect
+                raw_rect.x = free_area.x;
+                raw_rect.y = free_area.y;
+                placed_positions.push(Vector2::new(raw_rect.x, raw_rect.y));
+
+                // Update the free areas by splitting the used space
+                free_areas.remove(i);
+
+                // Add remaining free areas (split horizontally and vertically)
+                free_areas.push(RawRect { x: free_area.x + raw_rect.width, y: free_area.y, width: free_area.width - raw_rect.width, height: raw_rect.height });
+                free_areas.push(RawRect { x: free_area.x, y: free_area.y + raw_rect.height, width: free_area.width, height: free_area.height - raw_rect.height });
+                break;
+            }
+        }
+    }
+
+    placed_positions.iter().map(|x| [x.x, x.y]).collect()
+}
+
+#[derive(Copy, Clone)]
+pub struct RawRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
 
