@@ -5,7 +5,7 @@ use std::thread;
 use cgmath::{Vector2, Vector3};
 use rand::distributions::Uniform;
 use rand::prelude::{SliceRandom, ThreadRng};
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use web_sys::wasm_bindgen::UnwrapThrowExt;
 use crate::{logger, voxels, wgpulib, world_handler};
 use crate::chunks_refs::ChunksRefs;
@@ -15,18 +15,11 @@ use crate::lod::Lod;
 use crate::quad::{Direction, Quad};
 use crate::vertex_types::WorldMeshVertex;
 use crate::voxels::{VoxelType, VoxelVector};
-use crate::wgpulib::{ChunkInstance, ChunkInstanceRaw};
+use crate::wgpulib::{ChunkInstance, ChunkInstanceRaw, RawChunkRenderData};
 
 pub struct ChunkRaw {
     pub vertices: Vec<WorldMeshVertex>,
     pub indices: Vec<u32>,
-}
-
-#[derive(Default, Debug)]
-pub struct ChunkMesh {
-    pub instance: Vec<u8>,
-    pub indices: Vec<u32>,
-    pub vertices: Vec<WorldMeshVertex>,
 }
 pub struct Queue<T> {
     queue: Vec<T>,
@@ -125,16 +118,14 @@ impl<T: Send + 'static> DataWorker<T> {
         queue: ArcQueue<T>,
         process_item: F,
         voxel_vector: Arc<voxels::VoxelVector>,
-        atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
         result_queue: ArcQueue<(Vector3<i32>, ChunkData)>,
         chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>,
     ) -> Self
     where
-        F: Fn(T, Arc<voxels::VoxelVector>, Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>, Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>) -> (Vector3<i32>, ChunkData) + Send + 'static + Copy,
+        F: Fn(T, Arc<voxels::VoxelVector>, Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>) -> (Vector3<i32>, ChunkData) + Send + 'static + Copy,
     {
         let queue_clone = queue.clone();
         let voxel_vector_clone = Arc::clone(&voxel_vector);
-        let atlas_data_clone = Arc::clone(&atlas_data);
         let chunks_data_clone = Arc::clone(&chunks_data);
         let result_queue_clone = result_queue.clone();
 
@@ -143,7 +134,6 @@ impl<T: Send + 'static> DataWorker<T> {
                 let result = process_item(
                     item,
                     Arc::clone(&voxel_vector_clone),
-                    Arc::clone(&atlas_data_clone),
                     Arc::clone(&chunks_data_clone),
                 );
                 result_queue_clone.enqueue(result);
@@ -174,16 +164,14 @@ impl<T: Send + 'static + Clone> MeshWorker<T> {
         queue: ArcQueue<T>,
         process_item: F,
         voxel_vector: Arc<voxels::VoxelVector>,
-        atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
-        result_queue: ArcQueue<(Vector3<i32>, Option<ChunkMesh>)>,
+        result_queue: ArcQueue<(Vector3<i32>, Option<RawChunkRenderData>)>,
         chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>,
     ) -> Self
     where
-        F: Fn(T, Arc<voxels::VoxelVector>, Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>, Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>) -> Option<(Vector3<i32>, Option<ChunkMesh>)> + Send + 'static + Copy,
+        F: Fn(T, Arc<voxels::VoxelVector>, Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>) -> Option<(Vector3<i32>, Option<RawChunkRenderData>)> + Send + 'static + Copy,
     {
         let queue_clone = queue.clone();
         let voxel_vector_clone = Arc::clone(&voxel_vector);
-        let atlas_data_clone = Arc::clone(&atlas_data);
         let chunks_data_clone = Arc::clone(&chunks_data);
         let result_queue_clone = result_queue.clone();
 
@@ -192,7 +180,6 @@ impl<T: Send + 'static + Clone> MeshWorker<T> {
                 let result = process_item(
                     item.clone(),
                     Arc::clone(&voxel_vector_clone),
-                    Arc::clone(&atlas_data_clone),
                     Arc::clone(&chunks_data_clone),
                 );
 
@@ -230,10 +217,21 @@ impl ChunkData {
     {
         let mut voxels: Vec<u32> = Vec::new();
         let mut rng = ThreadRng::default();
-        let types = vec![0,5,6];
-        let voxel_type = types[rng.sample(Uniform::new(0, types.len()))];
+        let types = vec![5,0,6];
+        let mut voxel_type = 0;
+        let mut t = false;
+        // if thread_rng().gen_bool(1.0/2.0) {
+        //     t = true;
+        // }
+        if chunk_pos.x == 1 && chunk_pos.y == 1 && chunk_pos.z == 1 {
+            t = true;
+        }
+
         for i in 0..CHUNK_SIZE3 as usize
         {
+            if t {
+                voxel_type = types[rng.sample(Uniform::new(0, types.len()))];
+            }
             voxels.push(voxel_type);
         }
         ChunkData
@@ -461,17 +459,6 @@ impl ChunkData {
     }
 }
 
-fn push_face(mesh: &mut ChunkMesh, dir: Direction, vpos: Vector3<i32>, color: [f32; 3], voxel_type: u32) {
-    let quad = Quad::from_direction(dir, vpos, color);
-    for corner in quad.corners.into_iter() {
-        mesh.vertices.push(WorldMeshVertex {
-            position: [corner[0] as f32, corner[1] as f32, corner[2] as f32],
-            tex_coords: [0.0,0.0],
-            color,
-        });
-    }
-}
-
 #[inline]
 pub fn make_vertex_u32(
     pos: Vector3<i32>,
@@ -564,38 +551,6 @@ pub fn ambient_corner_voxels_cloned(
         result[i] = voxel_map.get(chunks_refs.get_voxel(positions[i]))?.is_solid();
     }
     Some(result)
-}
-
-fn push_face_ao(
-    chunks_refs: &ChunksRefs,
-    mesh: &mut ChunkMesh,
-    dir: Direction,
-    vpos: Vector3<i32>,
-    color: [f32; 3],
-    voxel_type: u32,
-    voxel_map: &Arc<VoxelVector>,
-) {
-    let ambient_corners = ambient_corner_voxels(&chunks_refs, dir, vpos, voxel_map);
-    let quad = Quad::from_direction(dir, vpos, color);
-    for (i, corner) in quad.corners.into_iter().enumerate() {
-        let index = i * 2;
-
-        let side_1 = ambient_corners[index] as u32;
-        let side_2 = ambient_corners[(index + 2) % 8] as u32;
-        let side_corner = ambient_corners[(index + 1) % 8] as u32;
-        let mut ao_count = side_1 + side_2 + side_corner;
-        // fully ambient occluded if both
-        if side_1 == 1 && side_2 == 1 {
-            ao_count = 3;
-        }
-
-        //todo fix ambient occlusion and also tex coords
-        mesh.vertices.push(WorldMeshVertex {
-            position: [corner[0] as f32, corner[1] as f32, corner[2] as f32],
-            tex_coords: [0.0, 0.0],
-            color,
-        });
-    }
 }
 
 

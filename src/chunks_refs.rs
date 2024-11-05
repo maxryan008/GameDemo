@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use cgmath::{Array, Vector3};
+use crate::constants::CHUNK_SIZE;
 use crate::quad::Direction;
 use crate::world_handler::ChunkData;
 
@@ -52,22 +53,22 @@ impl ChunksRefs {
     }
 
     pub fn get_voxel(&self, pos: Vector3<i32>) -> &u32 {
-        let x = (pos.x + 32) as u32;
-        let y = (pos.y + 32) as u32;
-        let z = (pos.z + 32) as u32;
-        let (x_chunk, x) = ((x / 32) as i32, (x % 32) as i32);
-        let (y_chunk, y) = ((y / 32) as i32, (y % 32) as i32);
-        let (z_chunk, z) = ((z / 32) as i32, (z % 32) as i32);
+        let x = (pos.x + CHUNK_SIZE as i32) as u32;
+        let y = (pos.y + CHUNK_SIZE as i32) as u32;
+        let z = (pos.z + CHUNK_SIZE as i32) as u32;
+        let (x_chunk, x) = ((x / CHUNK_SIZE as u32) as i32, (x % CHUNK_SIZE as u32) as i32);
+        let (y_chunk, y) = ((y / CHUNK_SIZE as u32) as i32, (y % CHUNK_SIZE as u32) as i32);
+        let (z_chunk, z) = ((z / CHUNK_SIZE as u32) as i32, (z % CHUNK_SIZE as u32) as i32);
 
         let chunk_index = vector3i_to_index(Vector3::new(x_chunk, y_chunk, z_chunk), 3);
         let chunk_data = &self.chunks[chunk_index];
-        let i = vector3i_to_index(Vector3::new(x, y, z), 32);
+        let i = vector3i_to_index(Vector3::new(x, y, z), CHUNK_SIZE as i32);
         chunk_data.get_voxel(i)
     }
 
     pub fn get_voxel_no_neighbour(&self, pos: Vector3<i32>) -> &u32 {
         let chunk_data = &self.chunks[13];
-        let i = vector3i_to_index(pos, 32);
+        let i = vector3i_to_index(pos, CHUNK_SIZE as i32);
         chunk_data.get_voxel(i)
     }
 

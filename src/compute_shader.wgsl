@@ -1,7 +1,7 @@
 struct TextureMapEntry {
-    position: vec2<f32>,
-    width: f32,
-    height: f32,
+    position: PackedVec2Unsigned,
+    width: u32,
+    height: u32,
 };
 
 struct PackedVec3 {
@@ -10,14 +10,19 @@ struct PackedVec3 {
     z: f32,
 };
 
-struct PackedVec2 {
+struct PackedVec2Float {
     x: f32,
     y: f32,
 };
 
+struct PackedVec2Unsigned {
+    x: u32,
+    y: u32,
+};
+
 struct ChunkMeshVertex {
     position: PackedVec3,
-    tex_coords: PackedVec2,
+    tex_coords: PackedVec2Float,
 };
 
 // Bindings for flat array inputs, texture atlas, and seed
@@ -41,7 +46,7 @@ struct ChunkMeshVertex {
 @group(1) @binding(6) var<storage, read_write> index_output: array<u32>;
 @group(1) @binding(7) var<storage, read> rect_widths: array<u32>;
 
-@group(2) @binding(0) var<storage, read> rect_positions: array<vec2<u32>>;
+@group(2) @binding(0) var<storage, read> rect_positions: array<PackedVec2Unsigned>;
 
 // Random number generation based on a seed
 fn random(seed: u32, index: u32, x: u32, y: u32) -> u32 {
@@ -52,10 +57,10 @@ fn random(seed: u32, index: u32, x: u32, y: u32) -> u32 {
 fn get_texture_coords(
     width: u32,
     height: u32,
-    pos: vec2<u32>,
-    output_size: PackedVec2,
+    pos: PackedVec2Unsigned,
+    output_size: PackedVec2Float,
     vertex_index: u32 // 0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left
-) -> PackedVec2 {
+) -> PackedVec2Float {
     // Base normalized coordinates based on the rectangle's position
     let base_tex_x = f32(pos.x) / output_size.x;
     let base_tex_y = f32(pos.y) / output_size.y;
@@ -74,7 +79,7 @@ fn get_texture_coords(
         tex_y = base_tex_y + f32(height) / output_size.y;
     }
 
-    return PackedVec2(tex_x, tex_y);
+    return PackedVec2Float(f32(tex_x), f32(tex_y));
 }
 
 @compute @workgroup_size(1, 1, 1)
@@ -83,6 +88,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Get rect position in the output texture (top-left corner)
     let rect_pos = rect_positions[rect_index];
+
+    //todo make sizes automatically calculated
+    let atlas_texture_width = 128.0;
+    let atlas_texture_height = 128.0;
+    let output_texture_width = 1024.0;
+    let output_texture_height = 1024.0;
+
+    let pixel_size_x = 1.0 / f32(atlas_texture_width);
+    let pixel_size_y = 1.0 / f32(atlas_texture_height);
+
 
     // Define array starts and ends for the current rect being rendered
     let vertices_start = rects_vertices_sizes[rect_index];
@@ -97,42 +112,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let rect_width = rect_widths[rect_index];
     let rect_height = (blocks_end - blocks_start) / rect_width;
 
-    let block_size = vec2<f32>(1.0 / f32(rect_width), 1.0 / f32(rect_height));  // Normalized size of each block
+    let test = vertices_flat[vertices_start];
 
     // Process vertices and write to the output buffer as ChunkMeshVertex
     for (var i = vertices_start; i < vertices_end; i = i + 1u) {
         let vertex_position = vertices_flat[i];
 
-        // Compute block position within the rect (row and column)
-        let block_index = (i - vertices_start);  // Cycle through blocks
-        let block_x = block_index % rect_width;
-        let block_y = block_index / rect_width;
-
-        // Get the block type from blocks_flat
-        let block_type = blocks_flat[blocks_start + block_index];
-
-        // Get the number of cumulative variants up to that block
-        let num_variants_cumulative = variant_lengths[block_type];
-        let num_variants_previous_cumulative = select(0u, variant_lengths[block_type - 1u], block_type > 0u);
-        let num_variants = num_variants_cumulative - num_variants_previous_cumulative;
-
-        // If num_variants > 0, select a variant, otherwise fallback to block_type directly
-        var selected_variant_index: u32 = 0u;
-        if num_variants > 0u {
-            let random_value = random(seed, block_index, block_x, block_y);
-            selected_variant_index = random_value % num_variants;  // Randomly select a variant
-        }
-
-        // Compute the base index in the texture map using the previous size plus the selected variant index
-        let variant_base_index = num_variants_previous_cumulative + selected_variant_index;
-
-        // Get the texture map entry for the selected variant
-        let texture_entry = texture_map[variant_base_index];
-
         // Compute the normalized texture coordinates for this vertex
         let vertex_index = (i - vertices_start);  // Determines which corner we are dealing with
-        //todo make output texture size automatically calculated
-        let tex_coords = get_texture_coords(rect_width, rect_height, rect_pos, PackedVec2(32.0, 32.0), vertex_index);
+        let tex_coords = get_texture_coords(rect_width, rect_height, rect_pos, PackedVec2Float(output_texture_width / 4.0, output_texture_height / 4.0), vertex_index);
 
         // Write vertex data to output
         vertex_output[i] = ChunkMeshVertex(
@@ -178,18 +166,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             for (var pixel_x = 0u; pixel_x < 4u; pixel_x = pixel_x + 1u) {
                 for (var pixel_y = 0u; pixel_y < 4u; pixel_y = pixel_y + 1u) {
                     let tex_coords_int = vec2<i32>(
-                        (i32(f32(texture_entry.position.x) / 0.03125f) * 4) + i32(pixel_x),
-                        (i32(f32(texture_entry.position.y) / 0.03125f) * 4) + i32(pixel_y)
+                        i32(texture_entry.position.x) + i32(pixel_x),
+                        i32(texture_entry.position.y) + i32(pixel_y)
                     );
 
                     let tex_color = textureLoad(atlas_texture, tex_coords_int, 0) + vec4<f32>(tint.x, tint.y, tint.z, 0);
+
                     // Write the sampled texture color to the correct location on the output texture
                     let output_coords = vec2<i32>(
                         i32(rect_pos.x) * 4 + i32(block_x) * 4 + i32(pixel_x),
                         i32(rect_pos.y) * 4 + i32(block_y) * 4 + i32(pixel_y)
                     );
 
-                    textureStore(output_texture, output_coords, tex_color);
+                    if (tex_color.r == 0.0 && tex_color.g == 0.0 && tex_color.b == 0.0 && tex_color.a == 0.0) {
+                        textureStore(output_texture, output_coords, vec4<f32>(1.0, 0.0, 1.0, 1.0));
+                    } else
+                    {
+                        textureStore(output_texture, output_coords, tex_color);
+                    }
                 }
             }
         }

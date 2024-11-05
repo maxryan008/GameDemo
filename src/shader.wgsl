@@ -59,6 +59,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
 
     // Return the sampled color
+    if (color.x == 0.0 && color.y == 0.0 && color.z == 0.0 && color.w == 0.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
     return color;
     //return vec4<f32>(1.0, 1.0, 1.0, 1.0);
 }

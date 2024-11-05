@@ -11,20 +11,24 @@ use crate::constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE_I32, CHUNK_SIZE_
 use crate::face_direction::FaceDir;
 use crate::lod::Lod;
 use crate::voxels::VoxelVector;
-use crate::wgpulib::{ChunkInstance, ChunkInstanceRaw};
+use crate::wgpulib::{ChunkInstance, ChunkInstanceRaw, RawChunkRenderData};
 use crate::{logger, voxels, world_handler};
 use crate::vertex_types::WorldMeshVertex;
-use crate::world_handler::{generate_indices, make_vertex_u32, ArcQueue, ChunkData, ChunkMesh, Queue, DataWorker, MeshWorker};
+use crate::world_handler::{generate_indices, make_vertex_u32, ArcQueue, ChunkData, Queue, DataWorker, MeshWorker, ChunkRaw};
 pub fn build_chunk_mesh(
     chunks_refs: &ChunksRefs,
     lod: Lod,
     voxel_map: &Arc<VoxelVector>,
     position: &Vector3<i32>,
-) -> Option<ChunkMesh> {
+) -> Option<RawChunkRenderData> {
     if chunks_refs.is_all_voxels_same() {
         return None;
     }
-    let mut mesh = ChunkMesh::default();
+
+    let mut mesh = RawChunkRenderData {
+        position: *position,
+        rects: Vec::new(),
+    };
 
     let mut axis_cols = [[[0u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3];
 
@@ -36,7 +40,7 @@ pub fn build_chunk_mesh(
         x: usize,
         y: usize,
         z: usize,
-        axis_cols: &mut [[[u64; 34]; 34]; 3],
+        axis_cols: &mut [[[u64; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3],
         voxel_map: &Arc<VoxelVector>,
     ) {
         if voxel_map.get(&b).unwrap().is_solid() {
@@ -104,12 +108,7 @@ pub fn build_chunk_mesh(
     }
 
     // greedy meshing planes for every axis (6)
-    // key(voxel + ao) -> HashMap<axis(0-32), binary_plane>
-    // note(leddoo): don't ask me how this isn't a massive blottleneck.
-    //  might become an issue in the future, when there are more voxel types.
-    //  consider using a single hashmap with key (axis, voxel_hash, y).
-    let mut data: [HashMap<u32, HashMap<u32, [u32; 32]>>; 6];
-    data = [
+    let mut data: [HashMap<u32, [u32; 32]>; 6] = [
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
@@ -118,65 +117,37 @@ pub fn build_chunk_mesh(
         HashMap::new(),
     ];
 
-    // find faces and build binary planes based on the voxel voxel+ao etc...
+    // Process each axis and build binary planes for each face
     for axis in 0..6 {
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
-                // skip padded by adding 1(for x padding) and (z+1) for (z padding)
                 let mut col = col_face_masks[axis][z + 1][x + 1];
 
-                // removes the right most padding value, because it's invalid
                 col >>= 1;
-                // removes the left most padding value, because it's invalid
                 col &= !(1 << CHUNK_SIZE as u64);
+
                 while col != 0 {
                     let y = col.trailing_zeros();
-                    // clear least significant set bit
-                    col &= col - 1;
+                    col &= col - 1; // Clear the least significant set bit
 
-                    // get the voxel position based on axis
-                    let voxel_pos = match axis {
-                        0 | 1 => Vector3::new(x as i32, y as i32, z as i32), // down,up
-                        2 | 3 => Vector3::new(y as i32, z as i32, x as i32), // left, right
-                        _ => Vector3::new(x as i32, z as i32, y as i32),     // forward, back
-                    };
+                    // Get the voxel position and determine which face this belongs to
+                    // let voxel_pos = match axis {
+                    //     0 | 1 => Vector3::new(x as i32, y as i32, z as i32),  // Down, Up
+                    //     2 | 3 => Vector3::new(y as i32, z as i32, x as i32),  // Left, Right
+                    //     _     => Vector3::new(x as i32, z as i32, y as i32),  // Forward, Back
+                    // };
 
-                    // calculate ambient occlusion
-                    let mut ao_index = 0;
-                    for (ao_i, ao_offset) in ADJACENT_AO_DIRS.iter().enumerate() {
-                        // ambient occlusion is sampled based on axis(ascent or descent)
-                        let ao_sample_offset = match axis {
-                            0 => Vector3::new(ao_offset.x, -1, ao_offset.y), // down
-                            1 => Vector3::new(ao_offset.x, 1, ao_offset.y),  // up
-                            2 => Vector3::new(-1, ao_offset.y, ao_offset.x), // left
-                            3 => Vector3::new(1, ao_offset.y, ao_offset.x),  // right
-                            4 => Vector3::new(ao_offset.x, ao_offset.y, -1), // forward
-                            _ => Vector3::new(ao_offset.x, ao_offset.y, 1),  // back
-                        };
-                        let ao_voxel_pos = voxel_pos + ao_sample_offset;
-                        let ao_voxel = chunks_refs.get_voxel(ao_voxel_pos);
-                        if voxel_map.get(ao_voxel)?.is_solid() {
-                            ao_index |= 1u32 << ao_i;
-                        }
-                    }
-
-                    let current_voxel = chunks_refs.get_voxel_no_neighbour(voxel_pos);
-                    // let current_voxel = chunks_refs.get_voxel(voxel_pos);
-                    // we can only greedy mesh same voxel types + same ambient occlusion
-                    let voxel_hash = ao_index | ((current_voxel) << 9);
-                    let data = data[axis]
-                        .entry(voxel_hash)
-                        .or_default()
-                        .entry(y)
-                        .or_default();
+                    // Mark the corresponding bit in the binary plane
+                    let data = data[axis].entry(y).or_default();
                     data[x as usize] |= 1u32 << z as u32;
                 }
             }
         }
     }
-    let mut vertices:Vec<WorldMeshVertex> = vec![];
-    for (axis, voxel_ao_data) in data.into_iter().enumerate() {
-        let facedir = match axis {
+
+    // Now build quads for each face, working with solid blocks
+    for (axis, axis_data) in data.iter().enumerate() {
+        let face_dir = match axis {
             0 => FaceDir::Down,
             1 => FaceDir::Up,
             2 => FaceDir::Left,
@@ -184,34 +155,87 @@ pub fn build_chunk_mesh(
             4 => FaceDir::Forward,
             _ => FaceDir::Back,
         };
-        for (voxel_ao, axis_plane) in voxel_ao_data.into_iter() {
-            let ao = voxel_ao & 0b111111111;
-            let voxel_type = voxel_ao >> 9;
-            for (axis_pos, plane) in axis_plane.into_iter() {
-                let quads_from_axis = greedy_mesh_binary_plane(plane, lod.size() as u32);
-                quads_from_axis.into_iter().for_each(|q| {
-                    q.append_vertices(&mut vertices, facedir, axis_pos, &Lod::L32, ao, voxel_type)
-                });
+
+        for (axis_pos, plane) in axis_data {
+            // Perform greedy meshing on the plane for the current face
+            let quads_from_axis = greedy_mesh_binary_plane(*plane, CHUNK_SIZE as u32);
+
+            // For each quad, create a rect
+            for quad in quads_from_axis {
+                let x = quad.x;
+                let y = quad.y;
+                let width = quad.w;
+                let height = quad.h;
+
+                let mut block_ids = Vec::with_capacity((width * height) as usize);
+
+                for i in 0..height {
+                    for j in 0..width {
+                        let block_id = match face_dir {
+                            FaceDir::Down => {
+                                // Bottom face (y = 0, facing downward)
+                                let voxel_index = (x + j) as usize + (y + i) as usize * CHUNK_SIZE + *axis_pos as usize * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                            FaceDir::Up => {
+                                // Top face (y = CHUNK_SIZE - 1, facing upward)
+                                let voxel_index = (CHUNK_SIZE - 1 - (x + j) as usize)
+                                    + (y + i) as usize * CHUNK_SIZE
+                                    + (CHUNK_SIZE - 1) * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                            FaceDir::Left => {
+                                // Left face (x = 0, facing left)
+                                let voxel_index = *axis_pos as usize
+                                    + (y + i) as usize * CHUNK_SIZE
+                                    + (CHUNK_SIZE - 1 - (x + j) as usize) * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                            FaceDir::Right => {
+                                // Right face (x = CHUNK_SIZE - 1, facing right)
+                                let voxel_index = (CHUNK_SIZE - 1) + (y + i) as usize * CHUNK_SIZE + (x + j) as usize * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                            FaceDir::Forward => {
+                                // Front face (z = 0, facing forward)
+                                let voxel_index = (CHUNK_SIZE - 1 - (x + j) as usize)
+                                    + *axis_pos as usize * CHUNK_SIZE
+                                    + (y + i) as usize * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                            FaceDir::Back => {
+                                // Back face (z = CHUNK_SIZE - 1, facing backward)
+                                let voxel_index = (x + j) as usize + (CHUNK_SIZE - 1) * CHUNK_SIZE + (y + i) as usize * CHUNK_SIZE * CHUNK_SIZE;
+                                chunk.voxels[voxel_index as usize]
+                            }
+                        };
+
+                        // Push block ID for each voxel
+                        block_ids.push(block_id);
+                    }
+                }
+
+                let vertices = create_vertices(face_dir, *axis_pos, x, y, width, height);
+                let indices = [0, 1, 2, 2, 3, 0];
+                let tints = vec![[0.0, 0.0, 0.0]; width as usize * height as usize];
+
+                let rect = Rect {
+                    vertices,
+                    indices,
+                    blocks: block_ids,
+                    tints,
+                    width: width as u32,
+                    height: height as u32,
+                };
+
+                mesh.rects.push(rect);
             }
         }
     }
-    let position = Vector3::new(position.x * CHUNK_SIZE as i32, position.y * CHUNK_SIZE as i32, position.z * CHUNK_SIZE as i32);
-    let rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0));
-    let chunk_instance = ChunkInstance {
-        position, rotation,
-    };
 
-    let binding = vec![chunk_instance].iter().map(ChunkInstance::to_raw).collect::<Vec<_>>();
-    let t1: &[u8] = bytemuck::cast_slice(&*binding);
-    mesh.instance = t1.to_vec();
-    mesh.vertices.extend(vertices);
-    if mesh.vertices.is_empty() {
+    if mesh.rects.is_empty() {
         None
     } else {
-        mesh.indices = generate_indices(mesh.vertices.len());
-        //println!("vertices: {:?}", mesh.vertices.len());
-        //println!("{:?}", mesh.indices);
-        //println!("{:?}", mesh.instance);
         Some(mesh)
     }
 }
@@ -223,6 +247,73 @@ pub struct GreedyQuad {
     pub y: u32,
     pub w: u32,
     pub h: u32,
+}
+
+fn create_vertices(
+    face_dir: FaceDir,
+    axis_pos: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> [[f32; 3]; 4] {
+    let mut vertices = [[0.0; 3]; 4];
+
+    match face_dir {
+        FaceDir::Down => {
+            // Bottom face (Y- axis, Z as up/down)
+            //MATCHES
+            vertices[0] = [x as f32, axis_pos as f32, y as f32];
+            vertices[3] = [x as f32, axis_pos as f32, (y + height) as f32];
+            vertices[2] = [(x + width) as f32, axis_pos as f32, (y + height) as f32];
+            vertices[1] = [(x + width) as f32, axis_pos as f32, y as f32];
+        }
+        FaceDir::Up => {
+            // Top face (Y+ axis, Z as up/down)
+            let axis_pos = axis_pos + 1;
+            //TODO flip
+            vertices[1] = [x as f32, axis_pos as f32, y as f32];
+            vertices[0] = [(x + width) as f32, axis_pos as f32, y as f32];
+            vertices[3] = [(x + width) as f32, axis_pos as f32, (y + height) as f32];
+            vertices[2] = [x as f32, axis_pos as f32, (y + height) as f32];
+        }
+        FaceDir::Left => {
+            // Left face (X- axis, Y as up/down), adjust for CCW
+            //Todo flip
+            vertices[1] = [axis_pos as f32, y as f32, x as f32];
+            vertices[0] = [axis_pos as f32, (y + height) as f32, x as f32];
+            vertices[3] = [axis_pos as f32, (y + height) as f32, (x + width) as f32];
+            vertices[2] = [axis_pos as f32, y as f32, (x + width) as f32];
+        }
+        FaceDir::Right => {
+            // Right face (X+ axis, Y as up/down), adjust for CCW
+            //MATCHES
+            let axis_pos = axis_pos + 1;
+            vertices[0] = [axis_pos as f32, y as f32, x as f32];
+            vertices[1] = [axis_pos as f32, (y + height) as f32, x as f32];
+            vertices[2] = [axis_pos as f32, (y + height) as f32, (x + width) as f32];
+            vertices[3] = [axis_pos as f32, y as f32, (x + width) as f32];
+        }
+        FaceDir::Forward => {
+            // Front face (Z- axis, X as left/right), adjust for CCW
+            //Todo flip
+            vertices[1] = [x as f32, y as f32, axis_pos as f32];
+            vertices[0] = [(x + width) as f32, y as f32, axis_pos as f32];
+            vertices[3] = [(x + width) as f32, (y + height) as f32, axis_pos as f32];
+            vertices[2] = [x as f32, (y + height) as f32, axis_pos as f32];
+        }
+        FaceDir::Back => {
+            // Back face (Z+ axis, X as left/right), adjust for CCW
+            let axis_pos = axis_pos + 1;
+            //MATCHES
+            vertices[0] = [x as f32, y as f32, axis_pos as f32];
+            vertices[1] = [(x + width) as f32, y as f32, axis_pos as f32];
+            vertices[2] = [(x + width) as f32, (y + height) as f32, axis_pos as f32];
+            vertices[3] = [x as f32, (y + height) as f32, axis_pos as f32];
+        }
+    }
+
+    vertices
 }
 
 impl GreedyQuad {
@@ -247,45 +338,6 @@ impl GreedyQuad {
         let v3ao = ((ao >> 5) & 1) + ((ao >> 8) & 1) + ((ao >> 7) & 1);
         let v4ao = ((ao >> 1) & 1) + ((ao >> 2) & 1) + ((ao >> 5) & 1);
 
-        // let v1 = make_vertex_u32(
-        //     face_dir.world_to_sample(axis as i32, self.x as i32, self.y as i32, &lod) * jump,
-        //     v1ao,
-        //     face_dir.normal_index(),
-        //     voxel_type,
-        // );
-        // let v2 = make_vertex_u32(
-        //     face_dir.world_to_sample(
-        //         axis as i32,
-        //         self.x as i32 + self.w as i32,
-        //         self.y as i32,
-        //         &lod,
-        //     ) * jump,
-        //     v2ao,
-        //     face_dir.normal_index(),
-        //     voxel_type,
-        // );
-        // let v3 = make_vertex_u32(
-        //     face_dir.world_to_sample(
-        //         axis as i32,
-        //         self.x as i32 + self.w as i32,
-        //         self.y as i32 + self.h as i32,
-        //         &lod,
-        //     ) * jump,
-        //     v3ao,
-        //     face_dir.normal_index(),
-        //     voxel_type,
-        // );
-        // let v4 = make_vertex_u32(
-        //     face_dir.world_to_sample(
-        //         axis as i32,
-        //         self.x as i32,
-        //         self.y as i32 + self.h as i32,
-        //         &lod,
-        //     ) * jump,
-        //     v4ao,
-        //     face_dir.normal_index(),
-        //     voxel_type,
-        // );
         let pos1 = (face_dir.world_to_sample(axis as i32, self.x as i32, self.y as i32, &lod) * jump);
         let pos2 = (face_dir.world_to_sample(axis as i32, self.x as i32 + self.w as i32, self.y as i32, &lod, ) * jump);
         let pos3 = (face_dir.world_to_sample(axis as i32, self.x as i32 + self.w as i32, self.y as i32 + self.h as i32, &lod, ) * jump);
@@ -382,7 +434,7 @@ pub struct WorldData {
     pub load_data_queue: ArcQueue<Vector3<i32>>,
     pub load_mesh_queue: ArcQueue<Vector3<i32>>,
     pub finished_data_queue: ArcQueue<(Vector3<i32>, ChunkData)>,
-    pub finished_mesh_queue: ArcQueue<(Vector3<i32>, Option<ChunkMesh>)>,
+    pub finished_mesh_queue: ArcQueue<(Vector3<i32>, Option<RawChunkRenderData>)>,
     pub data_workers: Vec<DataWorker<Vector3<i32>>>,
     pub mesh_workers: Vec<MeshWorker<Vector3<i32>>>,
     pub chunk_modifications: HashMap<Vector3<i32>, Vec<ChunkModification>>,
@@ -421,22 +473,21 @@ pub fn unload_data(mut world_data: WorldData) {
 pub fn start_data_tasks(
     mut world_data: &mut WorldData,
     voxel_vector: Arc<voxels::VoxelVector>,
-    atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
+    workers: u32,
 ) {
     logger::log("Starting Data Tasks");
     let mut data_workers = Vec::new();
     let arc_queue = ArcQueue::new();
     let finished_data_queue: ArcQueue<(Vector3<i32>, ChunkData)> = ArcQueue::new();
     let chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>> = world_data.chunks_data.clone();
-    for _ in 0..1 {
+    for _ in 0..workers {
         data_workers.push(DataWorker::new(
             arc_queue.clone(),
-            |item: Vector3<i32>, voxel_vector: Arc<VoxelVector>, atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>, chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>| -> (Vector3<i32>, ChunkData) {
+            |item: Vector3<i32>, voxel_vector: Arc<VoxelVector>, chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>| -> (Vector3<i32>, ChunkData) {
                 let chunk_data = ChunkData::generate(item);
                 return (item, chunk_data);
             },
             voxel_vector.clone(),
-            atlas_data.clone(),
             finished_data_queue.clone(),
             chunks_data.clone()
         ));
@@ -449,17 +500,17 @@ pub fn start_data_tasks(
 pub fn start_mesh_tasks(
     mut world_data: &mut WorldData,
     voxel_vector: Arc<voxels::VoxelVector>,
-    atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
+    workers: u32,
 ) {
     logger::log("Starting Mesh Tasks");
     let mut mesh_workers = Vec::new();
     let arc_queue = ArcQueue::new();
-    let finished_mesh_queue: ArcQueue<(Vector3<i32>, Option<ChunkMesh>)> = ArcQueue::new();
+    let finished_mesh_queue: ArcQueue<(Vector3<i32>, Option<RawChunkRenderData>)> = ArcQueue::new();
     let chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>> = world_data.chunks_data.clone();
-    for _ in 0..1 {
+    for _ in 0..workers {
         mesh_workers.push(MeshWorker::new(
             arc_queue.clone(),
-            |item: Vector3<i32>, voxel_vector: Arc<voxels::VoxelVector>, atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>, chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>| -> Option<(Vector3<i32>, Option<ChunkMesh>)> {
+            |item: Vector3<i32>, voxel_vector: Arc<voxels::VoxelVector>, chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>| -> Option<(Vector3<i32>, Option<RawChunkRenderData>)> {
                 let Some(chunks_refs) = ChunksRefs::try_new(chunks_data, item) else {
                     //logger::log("Not enough chunk references!");
                     return None
@@ -468,7 +519,6 @@ pub fn start_mesh_tasks(
                 return Some((item, build_chunk_mesh(&chunks_refs, llod, &voxel_vector, &item)));
             },
             voxel_vector.clone(),
-            atlas_data.clone(),
             finished_mesh_queue.clone(),
             chunks_data.clone()
         ));

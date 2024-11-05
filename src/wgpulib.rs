@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::{iter, thread};
-use std::ops::{Add, RangeFull};
+use std::mem::replace;
+use std::ops::{Add, Deref, RangeFull};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use cgmath::prelude::*;
@@ -9,8 +10,9 @@ use cgmath::{Quaternion, Vector2, Vector3};
 use image::{Rgba, RgbaImage};
 use pollster::block_on;
 use rand::{thread_rng, Rng};
-use wgpu::{BindGroupLayout, Buffer, BufferAddress, BufferBindingType, CommandEncoder, Device, Sampler};
-use wgpu::util::DeviceExt;
+use wgpu::{BindGroupLayout, Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferSlice, CommandEncoder, Device, MaintainResult, Sampler};
+use wgpu::hal::empty::Encoder;
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::{
     event::*,
     event_loop::EventLoop,
@@ -30,7 +32,7 @@ use crate::vertex_types::{ChunkMeshVertex, Vertex, WorldMeshVertex};
 use crate::voxels::{TexturePattern, VoxelVector};
 use crate::world_handler::{ArcQueue, Queue, DataWorker};
 
-const CULL_BACK_FACE: bool = false;
+const CULL_BACK_FACE: bool = true;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -62,13 +64,34 @@ pub struct BufferedChunk {
 }
 
 
-pub struct RawChunk {
+pub struct BufferedChunkData {
+    pub position: Vector3<i32>,
+    pub instance: Buffer,
+    pub vertex_buffer: Buffer,
+    pub index_buffer: Buffer,
+    pub chunk_texture: wgpu::Texture,
+    pub indices_length: u32,
+    pub chunk_texture_bind_group: wgpu::BindGroup,
+}
+
+
+#[derive(Clone)]
+pub struct RawChunkRenderData {
     pub position: Vector3<i32>,
     pub rects: Vec<Rect>,
-    pub atlas: RgbaImage,
-    // texture map is in format of HashMap<block id, (Variant of block array<Vector 2 position of top left spot of texture in atlas>, width of texture in atlas, height of texture in atlas)>
-    pub texture_map: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
 }
+
+
+impl Default for RawChunkRenderData {
+    fn default() -> Self {
+        RawChunkRenderData {
+            position: Vector3::from_value(0),
+            rects: Vec::new(),
+        }
+    }
+}
+
+
 impl ChunkInstance {
     pub fn to_raw(&self) -> ChunkInstanceRaw {
         ChunkInstanceRaw {
@@ -174,9 +197,9 @@ struct State<'a> {
     world_data: WorldData,
     voxel_vector: Arc<voxels::VoxelVector>,
     atlas: RgbaImage,
-    texture_map: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>>,
-    opaque_mesh_buffer: HashMap<Vector3<i32>, (Buffer, Buffer, Buffer, u32)>,
-    buffered_chunks: HashMap<Vector3<i32>, BufferedChunk>,
+    texture_map: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>>,
+    buffered_chunks: HashMap<Vector3<i32>, BufferedChunkData>,
+    unfinished_chunks: HashMap<Vector3<i32>, BufferedChunk>,
     texture_bind_group_layout: BindGroupLayout,
     texture_sampler: Sampler,
 }
@@ -462,7 +485,7 @@ impl<'a> State<'a> {
 
         let voxel_vector = Arc::new(voxels);
 
-        let atlas_data: Arc<HashMap<u32, (Vec<Vector2<f32>>, f32, f32)>> = Arc::new(texture_map);
+        let atlas_data: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>> = Arc::new(texture_map);
 
         let mut world_data: WorldData = WorldData
         {
@@ -476,12 +499,12 @@ impl<'a> State<'a> {
             chunk_modifications: HashMap::new(),
         };
 
-        start_data_tasks(&mut world_data, voxel_vector.clone(), atlas_data.clone());
-        start_mesh_tasks(&mut world_data, voxel_vector.clone(), atlas_data.clone());
-
-        let opaque_mesh_buffer = HashMap::new();
+        start_data_tasks(&mut world_data, voxel_vector.clone(), 3);
+        start_mesh_tasks(&mut world_data, voxel_vector.clone(), 3);
 
         let buffered_chunks = HashMap::new();
+
+        let unfinished_chunks = HashMap::new();
 
         let texture_sampler = create_sampler(&device);
 
@@ -508,8 +531,8 @@ impl<'a> State<'a> {
             world_data,
             texture_map: atlas_data,
             voxel_vector,
-            opaque_mesh_buffer,
             buffered_chunks,
+            unfinished_chunks,
             texture_bind_group_layout,
             texture_sampler,
         }
@@ -578,26 +601,89 @@ impl<'a> State<'a> {
             let (position, chunk_mesh) = result;
             if let Some(chunk_mesh_result) = chunk_mesh
             {
-                //
-                // let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                //     label: Some("Vertex Buffer"),
-                //     contents: bytemuck::cast_slice(&chunk_mesh_result.vertices),
-                //     usage: wgpu::BufferUsages::VERTEX,
-                // });
-                // let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                //     label: Some("Index Buffer"),
-                //     contents:  bytemuck::cast_slice(&chunk_mesh_result.indices),
-                //     usage: wgpu::BufferUsages::INDEX,
-                // });
-                // let instance_buffer = self.device.create_buffer_init(
-                //     &wgpu::util::BufferInitDescriptor {
-                //         label: Some("Instance Buffer"),
-                //         contents: bytemuck::cast_slice(&chunk_mesh_result.instance),
-                //         usage: wgpu::BufferUsages::VERTEX,
-                //     }
-                // );
-                // self.opaque_mesh_buffer.insert(position,(instance_buffer, vertex_buffer, index_buffer, chunk_mesh_result.indices.len() as u32));
+                self.unfinished_chunks.insert(position, process_raw_chunk(chunk_mesh_result, &self.device, &self.queue, self.atlas.clone(), self.texture_map.clone()));
             }
+        }
+
+        let mut calculated_chunks: Vec<Vector3<i32>> = Vec::new();
+
+        for (position, buffered_chunk) in self.unfinished_chunks.iter_mut() {
+            // Poll the GPU to check if this chunk's texture is ready
+            self.device.poll(wgpu::Maintain::Poll);
+
+            // Create the texture bind group dynamically from the chunk's texture
+            let chunk_texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&buffered_chunk.chunk_texture.create_view(
+                            &wgpu::TextureViewDescriptor::default(),
+                        )),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                    },
+                ],
+                label: Some("Chunk Texture Bind Group"),
+            });
+
+            // Move the data from unfinished_chunks to buffered_chunks
+            let instance_buffer = replace(
+                &mut buffered_chunk.instance_buffer,
+                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+            );
+
+            let vertex_buffer = replace(
+                &mut *buffered_chunk.vertex_buffer.lock().unwrap(),
+                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+            );
+
+            let index_buffer = replace(
+                &mut *buffered_chunk.index_buffer.lock().unwrap(),
+                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+            );
+
+            let chunk_texture = replace(
+                &mut buffered_chunk.chunk_texture,
+                self.device.create_texture(&wgpu::TextureDescriptor { // Replace with a dummy texture
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                    label: Some("Dummy Texture"),
+                    view_formats: &[],
+                }),
+            );
+
+            // Copy buffers as needed
+            let vertex_buffer_copy = copy_buffer(&self.device, &self.queue, &vertex_buffer, vertex_buffer.size(), vertex_buffer.usage());
+            let index_buffer_copy = copy_buffer(&self.device, &self.queue, &index_buffer, index_buffer.size(), index_buffer.usage());
+
+            // Insert into buffered_chunks
+            self.buffered_chunks.insert(buffered_chunk.position, BufferedChunkData {
+                position: buffered_chunk.position,
+                instance: instance_buffer, // Use moved instance buffer
+                vertex_buffer: vertex_buffer_copy, // Use copied vertex buffer
+                index_buffer: index_buffer_copy,   // Use copied index buffer
+                chunk_texture,                     // Move the texture directly
+                indices_length: buffered_chunk.indices_length,
+                chunk_texture_bind_group,
+            });
+
+            calculated_chunks.push(*position);
+        }
+
+        // After moving, remove the processed chunks
+        for pos in calculated_chunks {
+            self.unfinished_chunks.remove(&pos);
         }
     }
 
@@ -667,48 +753,22 @@ impl<'a> State<'a> {
             }
 
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-
-            // Render all buffered chunks
-            for (position, buffered_chunk) in &self.buffered_chunks {
-                // Poll the GPU to check if this chunk's texture is ready
-                self.device.poll(wgpu::Maintain::Poll);
-
-                // Ensure that the texture is done building
-                // For example, you could add some condition or status check to ensure
-                // the texture was fully built before rendering, but we'll assume it's ready for simplicity.
-
-                // Create the texture bind group dynamically from the chunk's texture
-                let chunk_texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    layout: &self.texture_bind_group_layout, // Assuming you have a texture bind group layout
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&buffered_chunk.chunk_texture.create_view(
-                                &wgpu::TextureViewDescriptor::default(),
-                            )),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.texture_sampler), // Use the created sampler
-                        },
-                    ],
-                    label: Some("Chunk Texture Bind Group"),
-                });
-
-                //println!("Rendering chunk at {:?}", position);
+                // Render all buffered chunks
+                println!("Rendering {:?} chunks", self.buffered_chunks.len());
+                for (position, chunk) in self.buffered_chunks.iter() {
                 // Set the texture bind group for the chunk's texture
-                render_pass.set_bind_group(0, &chunk_texture_bind_group, &[]);
+                render_pass.set_bind_group(0, &chunk.chunk_texture_bind_group, &[]);
 
                 // Set the vertex and instance buffers
-                render_pass.set_vertex_buffer(0, buffered_chunk.vertex_buffer.lock().unwrap().slice(..));
+                render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                 //render_pass.set_vertex_buffer(0, vertices_flat_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, buffered_chunk.instance_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, chunk.instance.slice(..));
 
                 // Set the index buffer
-                render_pass.set_index_buffer(buffered_chunk.index_buffer.lock().unwrap().slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 //render_pass.set_index_buffer(indices_flat_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 // Draw the chunk with the correct number of indices and instances
-                render_pass.draw_indexed(0..buffered_chunk.indices_length, 0, 0..1);
+                render_pass.draw_indexed(0..chunk.indices_length, 0, 0..1);
             }
         }
 
@@ -739,57 +799,17 @@ pub async fn run() {
 
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = instant::Instant::now();
-    for x in 0..15
+    let world_size_cubed = 3;
+    for x in 0..world_size_cubed
     {
-        for y in 0..3
+        for y in 0..world_size_cubed
         {
-            for z in 0..15
+            for z in 0..world_size_cubed
             {
                 state.load_chunk(Vector3::new(x, y, z));
             }
         }
     }
-
-    let buffered_chunk = process_raw_chunk(
-        RawChunk {
-            position: Vector3::new(0, 0, 0),
-            rects: vec![
-                Rect {
-                    vertices: [
-                        [0.0,0.0,0.0],
-                        [0.0,2.0,0.0],
-                        [2.0,2.0,0.0],
-                        [2.0,0.0,0.0]
-                    ],
-                    indices: [0,1,2,2,3,0],
-                    blocks: vec![1,2,3,4,5,6,5,4,3],
-                    tints: vec![[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]],
-                    width: 3,
-                    height: 3,
-                },
-                Rect {
-                    vertices: [
-                        [0.0,0.0,20.0],
-                        [20.0,0.0,20.0],
-                        [20.0,0.0,0.0],
-                        [0.0,0.0,0.0]
-                    ],
-                    indices: [0,1,2,2,3,0],
-                    blocks: vec![1,2,3,4,5,6,5,4,3],
-                    tints: vec![[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]],
-                    width: 3,
-                    height: 3,
-                }
-            ],
-            atlas: state.atlas.clone(),
-            texture_map: state.texture_map.clone(),
-        },
-        &state.device,
-        &state.queue,
-    );
-
-    state.buffered_chunks.insert(buffered_chunk.position, buffered_chunk);
-
     window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_e| window.set_cursor_grab(CursorGrabMode::Confined)).unwrap();
     window.set_cursor_visible(false);
 
@@ -844,12 +864,14 @@ pub async fn run() {
 }
 
 pub fn process_raw_chunk(
-    raw_chunk: RawChunk,
+    mut raw_chunk: RawChunkRenderData,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    atlas: RgbaImage,
+    texture_map: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>>,
 ) -> BufferedChunk
 {
-    let atlas_size = raw_chunk.atlas.dimensions();
+    let atlas_size = atlas.dimensions();
 
     // 1. Upload atlas texture
     let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -875,7 +897,7 @@ pub fn process_raw_chunk(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &raw_chunk.atlas,
+        &atlas,
         wgpu::ImageDataLayout {
             offset: 0,
             bytes_per_row: Some(4 * atlas_size.0),
@@ -891,8 +913,8 @@ pub fn process_raw_chunk(
     // 2. Create output texture for stitched result
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
         size: wgpu::Extent3d {
-            width: atlas_size.0,
-            height: atlas_size.1,
+            width: 1024,
+            height: 1024,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -917,14 +939,12 @@ pub fn process_raw_chunk(
     let mut rects_indices_sizes: Vec<u32> = vec![];
     let mut rects_blocks_sizes: Vec<u32> = vec![];
     let mut rects_tints_sizes: Vec<u32> = vec![];
-    let mut rects_widths: Vec<u32> = vec![];
 
     for rect in raw_chunk.rects.clone() {
         rects_vertices_sizes.push(vertices_flat.len() as u32);
         rects_indices_sizes.push(indices_flat.len() as u32);
         rects_blocks_sizes.push(blocks_flat.len() as u32);
         rects_tints_sizes.push(tints_flat.len() as u32);
-        rects_widths.push(rect.width);
         vertices_flat.extend(rect.vertices);
         indices_flat.extend(rect.indices);
         blocks_flat.extend(rect.blocks);
@@ -935,13 +955,15 @@ pub fn process_raw_chunk(
     rects_blocks_sizes.push(blocks_flat.len() as u32);
     rects_tints_sizes.push(tints_flat.len() as u32);
 
-    //todo make width and height automatic
-    let positions: Vec<[u32;2]> = pack_rects(&raw_chunk.rects, 128, 128);
+    println!("{:?}", blocks_flat);
 
-    // Upload the positions to the GPU
+    //todo make width and height automatic
+    let (packed_positions, rects_widths): (Vec<[u32;2]>, Vec<u32>) = pack_rects_in_rows(&raw_chunk.rects, 1024, 1024);
+
+    // Upload the packed_positions to the GPU
     let positions_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Rect Positions Buffer"),
-        contents: bytemuck::cast_slice(&positions),
+        contents: bytemuck::cast_slice(&packed_positions),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -1001,16 +1023,16 @@ pub fn process_raw_chunk(
     });
 
     // Texture map buffer (flattened texture map data)
-    let mut sorted_keys: Vec<_> = raw_chunk.texture_map.keys().cloned().collect();
+    let mut sorted_keys: Vec<_> = texture_map.keys().cloned().collect();
     sorted_keys.sort();  // Sort the ids
 
-    let mut texture_map_data: Vec<f32> = Vec::new();  // Assuming f32 for the data
+    let mut texture_map_data: Vec<u32> = Vec::new();
     let mut cumulative_variant_lengths: Vec<u32> = Vec::new();
     let mut cumulative_sum: u32 = 0;
 
     for id in sorted_keys {
         // Get the value associated with the current id
-        if let Some((variants, width, height)) = raw_chunk.texture_map.get(&id) {
+        if let Some((variants, width, height)) = texture_map.get(&id) {
             // Flatten the variants into the texture_map_data
             for variant in variants {
                 texture_map_data.extend_from_slice(&[variant.x, variant.y, *width, *height]);
@@ -1021,12 +1043,6 @@ pub fn process_raw_chunk(
             cumulative_variant_lengths.push(cumulative_sum);
         }
     }
-
-    println!("blocks: {:?}", blocks_flat);
-    println!("blocks sizes: {:?}", rects_blocks_sizes);
-    println!("texture map data: {:?}", texture_map_data);
-    println!("texture map data: {:?}", texture_map_data.len());
-    println!("variants length: {:?}", cumulative_variant_lengths);
 
     let texture_map_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Texture Map Buffer"),
@@ -1399,7 +1415,7 @@ pub fn process_raw_chunk(
         &wgpu::util::BufferInitDescriptor {
             label: Some("Instance Buffer"),
             contents: &instance,
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC,
         }
     );
 
@@ -1414,34 +1430,43 @@ pub fn process_raw_chunk(
 }
 
 // Function to pack rects and return their top-left positions
-fn pack_rects(rects: &Vec<Rect>, output_width: u32, output_height: u32) -> Vec<[u32; 2]> {
-    let mut placed_positions = Vec::new(); // To store the top-left positions
-    let mut free_areas = vec![RawRect { x: 0, y: 0, width: output_width, height: output_height }];
+fn pack_rects_in_rows(rects: &Vec<Rect>, output_width: u32, output_height: u32) -> (Vec<[u32; 2]>, Vec<u32>) {
+    let mut placed_positions = vec![[0; 2]; rects.len()]; // To store the top-left positions, initialized to 0
+    let mut placed_widths = vec![0; rects.len()];
+    let mut current_row_y = 0; // Start from the top row
+    let mut current_row_x = 0; // Track the current X position in the row
+    let mut max_row_height = 0; // Track the maximum height in the current row
 
-    for rect in rects.iter() {
-        let mut raw_rect = RawRect {x:0,y:0,width:rect.width, height:rect.height};
-        for i in (0..free_areas.len()).rev() {
-            let free_area = &free_areas[i].clone();
+    // Create a vector of rects along with their original indices
+    let mut indexed_rects: Vec<(usize, &Rect)> = rects.iter().enumerate().collect();
 
-            // Check if the rect fits in the free area
-            if raw_rect.width <= free_area.width && raw_rect.height <= free_area.height {
-                // Place the rect
-                raw_rect.x = free_area.x;
-                raw_rect.y = free_area.y;
-                placed_positions.push(Vector2::new(raw_rect.x, raw_rect.y));
+    // Sort the rects by height (optional, helps to pack the tallest rects first)
+    indexed_rects.sort_by_key(|(_, r)| std::cmp::Reverse(r.height));
 
-                // Update the free areas by splitting the used space
-                free_areas.remove(i);
-
-                // Add remaining free areas (split horizontally and vertically)
-                free_areas.push(RawRect { x: free_area.x + raw_rect.width, y: free_area.y, width: free_area.width - raw_rect.width, height: raw_rect.height });
-                free_areas.push(RawRect { x: free_area.x, y: free_area.y + raw_rect.height, width: free_area.width, height: free_area.height - raw_rect.height });
-                break;
-            }
+    for (original_index, rect) in indexed_rects.iter() {
+        // Check if the rect can fit in the current row
+        if current_row_x + rect.width > output_width {
+            // Move to the next row if the rect doesn't fit horizontally
+            current_row_y += max_row_height;
+            current_row_x = 0; // Reset the X position to the start of the row
+            max_row_height = 0; // Reset max row height for the new row
         }
+
+        // Check if we have enough height for the next row
+        if current_row_y + rect.height > output_height {
+            println!("Error: Could not place rect with width {} and height {}", rect.width, rect.height);
+            continue; // Skip this rect if there's no more room
+        }
+
+        // Place the rect in the current row
+        placed_positions[*original_index] = [current_row_x, current_row_y]; // Store in the original order
+        placed_widths[*original_index] = rect.width;
+        // Update the current row's X position and max row height
+        current_row_x += rect.width;
+        max_row_height = max_row_height.max(rect.height);
     }
 
-    placed_positions.iter().map(|x| [x.x, x.y]).collect()
+    (placed_positions, placed_widths)
 }
 
 #[derive(Copy, Clone)]
@@ -1452,4 +1477,80 @@ pub struct RawRect {
     height: u32,
 }
 
+fn copy_texture(
+    device: &wgpu::Device,
+    src_texture: &wgpu::Texture,
+) -> wgpu::Texture {
+    // Hardcode the texture descriptor for a 1024x1024 RGBA texture
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Texture Cloning Encoder"),
+    });
 
+    let texture_desc = wgpu::TextureDescriptor {
+        size: wgpu::Extent3d {
+            width: 1024,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        label: Some("Destination Texture"),
+        view_formats: &[],
+    };
+
+    // Create the destination texture
+    let dst_texture = device.create_texture(&texture_desc);
+
+    // Define source and destination texture copies
+    let src_copy = wgpu::ImageCopyTexture {
+        texture: src_texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+        aspect: wgpu::TextureAspect::All,
+    };
+
+    let dst_copy = wgpu::ImageCopyTexture {
+        texture: &dst_texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+        aspect: wgpu::TextureAspect::All,
+    };
+
+    // Perform the copy operation
+    encoder.copy_texture_to_texture(src_copy, dst_copy, texture_desc.size);
+
+    dst_texture
+}
+
+fn copy_buffer(device: &wgpu::Device, queue: &wgpu::Queue, original_buffer: &wgpu::Buffer, size: wgpu::BufferAddress, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    // Create a new buffer with the same size and usage as the original one
+    let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Cloned Buffer"),
+        size: size,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Submit a command to copy from the original buffer to the new buffer
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Buffer Copy Encoder"),
+    });
+    encoder.copy_buffer_to_buffer(original_buffer, 0, &new_buffer, 0, size);
+
+    // Submit the commands to the queue
+    queue.submit(Some(encoder.finish()));
+
+    new_buffer
+}
+
+fn create_dummy_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Dummy Buffer"),
+        size: 1, // Minimal size
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
