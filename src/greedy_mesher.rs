@@ -1,23 +1,14 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::process::exit;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use cgmath::{Array, Rotation3, Vector2, Vector3, Zero};
-use cgmath::num_traits::AsPrimitive;
-use log::error;
-use rand::{thread_rng, Rng};
-use tobj::Mesh;
-use wgpu::PrimitiveTopology;
-use winit::keyboard::NamedKey::Exit;
+use cgmath::{Array, Vector3, Zero};
 use crate::chunks_refs::{vector3i_to_index, ChunksRefs};
-use crate::constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE2, CHUNK_SIZE2_I32, CHUNK_SIZE3, CHUNK_SIZE_I32, CHUNK_SIZE_P};
+use crate::constants::{CHUNK_SIZE, CHUNK_SIZE2, CHUNK_SIZE_I32, CHUNK_SIZE_P};
 use crate::face_direction::FaceDir;
 use crate::lod::Lod;
 use crate::voxels::VoxelVector;
-use crate::wgpulib::{get_chunk_pos_from_world, vec3_i32_f32, ChunkInstance, ChunkInstanceRaw, RawChunkRenderData};
-use crate::{logger, voxels, world_handler};
-use crate::vertex_types::WorldMeshVertex;
-use crate::world_handler::{generate_indices, make_vertex_u32, ArcQueue, ChunkData, Queue, DataWorker, MeshWorker, ChunkRaw};
+use crate::wgpulib::{get_chunk_pos_from_world, vec3_i32_f32, RawChunkRenderData};
+use crate::{logger, voxels};
+use crate::world_handler::{ArcQueue, ChunkData, DataWorker, MeshWorker};
 pub fn build_chunk_mesh(
     chunks_refs: &ChunksRefs,
     lod: Lod,

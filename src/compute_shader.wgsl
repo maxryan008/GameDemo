@@ -48,9 +48,21 @@ struct ChunkMeshVertex {
 
 @group(2) @binding(0) var<storage, read> rect_positions: array<PackedVec2Unsigned>;
 
-// Random number generation based on a seed
-fn random(seed: u32, index: u32, x: u32, y: u32) -> u32 {
-    return (seed + index * 1664525u * x + 1013904223u * y) & 0xFFFFFFFFu;
+// Determine the direction of the rect based on the vertices.
+fn get_face_direction(vertices: array<PackedVec3, 4>) -> u32 {
+    if vertices[0].x == vertices[1].x && vertices[0].x == vertices[2].x && vertices[0].x == vertices[3].x {
+        return 0u; // X-aligned face (Left or Right)
+    } else if vertices[0].y == vertices[1].y && vertices[0].y == vertices[2].y && vertices[0].y == vertices[3].y {
+        return 1u; // Y-aligned face (Up or Down)
+    } else if vertices[0].z == vertices[1].z && vertices[0].z == vertices[2].z && vertices[0].z == vertices[3].z {
+        return 2u; // Z-aligned face (Front or Back)
+    }
+    return 3u; // Unknown, should not happen
+}
+
+// Random function based on direction
+fn random(seed: u32, world_x: u32, world_y: u32, world_z: u32) -> u32 {
+    return (seed + (world_x * 73856093u) ^ (world_y * 19349663u) ^ (world_z * 83492791u)) & 0xFFFFFFFFu;
 }
 
 // Function to calculate normalized texture coordinates for each block
@@ -72,7 +84,7 @@ fn get_texture_coords(
     // Adjust tex_x and tex_y based on which corner (vertex) we are calculating for
     if (vertex_index == 0u || vertex_index == 3u) {
         // Top-right or bottom-right corner
-        tex_x = base_tex_x + f32(width) / (output_size.x/4.0);
+        tex_x = base_tex_x + f32(width) / (output_size.x / 4.0);
     }
     if (vertex_index == 3u || vertex_index == 2u) {
         // Bottom-right or bottom-left corner
@@ -139,27 +151,43 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         for (var block_y = 0u; block_y < rect_height; block_y = block_y + 1u) {
             let block_index = (rect_height - 1 - block_y) * rect_width + block_x;
 
-            // Get the block type from blocks_flat
             let block_type = blocks_flat[blocks_start + block_index];
-            // Get the tint from the tints_flat
             let tint = tints_flat[tints_start + block_index];
 
-            // Get the number of cumulative variants up to that block
             let num_variants_cumulative = variant_lengths[block_type];
             let num_variants_previous_cumulative = select(0u, variant_lengths[block_type - 1u], block_type > 0u);
             let num_variants = num_variants_cumulative - num_variants_previous_cumulative;
 
-            // If num_variants > 0, select a variant, otherwise fallback to block_type directly
+            let vertices = array<PackedVec3,4>(vertices_flat[vertices_start],vertices_flat[vertices_start+1],vertices_flat[vertices_start+2],vertices_flat[vertices_start+3]);
+
             var selected_variant_index: u32 = 0u;
             if num_variants > 0u {
-                let random_value = random(seed, block_index, block_x, block_y);
-                selected_variant_index = random_value % num_variants;  // Randomly select a variant
+                let face_direction = get_face_direction(vertices);
+                var world_x: u32 = 0u;
+                var world_y: u32 = 0u;
+                var world_z: u32 = 0u;
+
+                // Map block_x and block_y to the correct world axes based on face direction
+                if face_direction == 0u { // X-aligned face
+                    world_x = u32(vertices[0].x); // Fixed X from the face
+                    world_y = u32(vertices[0].y + f32(block_y)); // Map block_y to world Y
+                    world_z = u32(vertices[0].z + f32(block_x)); // Map block_x to world Z
+                } else if face_direction == 1u { // Y-aligned face
+                    world_x = u32(vertices[0].x + f32(block_x)); // Map block_x to world X
+                    world_y = u32(vertices[0].y); // Fixed Y from the face
+                    world_z = u32(vertices[0].z + f32(rect_height - 1 - block_y)); // Map block_y to world Z
+                } else if face_direction == 2u { // Z-aligned face
+                    world_x = u32(vertices[0].x + f32(block_x)); // Map block_x to world X
+                    world_y = u32(vertices[0].y + f32(block_y)); // Map block_y to world Y
+                    world_z = u32(vertices[0].z); // Fixed Z from the face
+                }
+
+                // Use the calculated world coordinates to generate randomness
+                let random_value = random(seed, world_x, world_y, world_z);
+                selected_variant_index = random_value % num_variants;
             }
 
-            // Compute the base index in the texture map using the previous size plus the selected variant index
             let variant_base_index = num_variants_previous_cumulative + selected_variant_index;
-
-            // Get the texture map entry for the selected variant
             let texture_entry = texture_map[variant_base_index];
 
             // Sample the atlas texture for this block and apply the tint

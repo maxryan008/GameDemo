@@ -11,9 +11,6 @@ pub enum FaceDir {
     Forward,
     Back,
 }
-
-pub const FACES: [FaceDir; 6] = [FaceDir::Up, FaceDir::Down, FaceDir::Left, FaceDir::Right, FaceDir::Forward, FaceDir::Back];
-
 impl FaceDir {
     pub fn normal_index(&self) -> u32 {
         match self {

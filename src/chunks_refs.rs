@@ -18,7 +18,7 @@ impl ChunksRefs {
         let mut chunks = vec![];
         for i in 0..3 * 3 * 3 {
             let offset = index_to_vector3i_bounds(i, 3) + Vector3::from_value(-1);
-            if let Ok(mut chunks_data) = world_data.lock() {
+            if let Ok(chunks_data) = world_data.lock() {
                 if let Some(chunk_data ) = chunks_data.get(&(middle_chunk + offset)) {
                     chunks.push(Arc::clone(
                         chunk_data,
@@ -120,7 +120,7 @@ pub fn index_to_vector3i_bounds_reverse(i: i32, bounds: i32) -> Vector3<i32> {
 #[inline]
 pub fn vector3i_to_index(pos: Vector3<i32>, bounds: i32) -> usize {
     let x_i = pos.x % bounds;
-    let y_i = (pos.y * bounds);
-    let z_i = pos.z * (bounds * bounds);
+    let y_i = pos.y * bounds;
+    let z_i = pos.z * bounds * bounds;
     (x_i + y_i + z_i) as usize
 }

@@ -1,38 +1,31 @@
 use std::collections::HashMap;
-use std::{iter, thread};
+use std::{iter};
 use std::mem::replace;
-use std::ops::{Add, Deref, Div, RangeFull};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use cgmath::prelude::*;
-use std::sync::mpsc;
 use cgmath::{Quaternion, Vector2, Vector3};
 use image::{Rgba, RgbaImage};
-use pollster::block_on;
 use rand::{thread_rng, Rng};
-use wgpu::{BindGroupLayout, Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferSlice, CommandEncoder, Device, MaintainResult, Sampler, SurfaceConfiguration};
-use wgpu::hal::empty::Encoder;
-use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu::{BindGroupLayout, Buffer, BufferBindingType, Device, Sampler};
+use wgpu::util::{DeviceExt};
 use winit::{
     event::*,
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
-use winit::monitor::MonitorHandle;
 use winit::window::{CursorGrabMode, Fullscreen};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-use crate::{camera, logger, texture_packer, timeit, vertex_types, voxels, world_handler};
+use crate::{camera, logger, voxels};
 use crate::constants::{CHUNK_SIZE, TEXTURE_OUTPUT_SIZE};
-use crate::face_direction::{FaceDir, FACES};
-use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, start_modifications, unload_data, Rect, WorldData};
+use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, start_modifications, Rect, WorldData};
 use crate::texture;
 use crate::texture::Texture;
 use crate::texture_packer::find_optimal_atlas_size;
-use crate::vertex_types::{ChunkMeshVertex, Vertex, WorldMeshVertex};
-use crate::voxels::{TexturePattern, VoxelVector};
-use crate::world_handler::{ArcQueue, Queue, DataWorker};
+use crate::vertex_types::{ChunkMeshVertex, Vertex};
+use crate::voxels::{TexturePattern};
+use crate::world_handler::{run_game_updates, ArcQueue};
 
 const CULL_BACK_FACE: bool = true;
 const FULL_SCREEN: bool = true;
@@ -68,11 +61,9 @@ pub struct BufferedChunk {
 
 
 pub struct BufferedChunkData {
-    pub position: Vector3<i32>,
     pub instance: Buffer,
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
-    pub chunk_texture: wgpu::Texture,
     pub indices_length: u32,
     pub chunk_texture_bind_group: wgpu::BindGroup,
 }
@@ -192,13 +183,10 @@ struct State<'a> {
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    diffuse_texture: texture::Texture,
-    diffuse_bind_group: wgpu::BindGroup,
     #[allow(dead_code)]
     depth_texture: texture::Texture,
     mouse_pressed: bool,
     world_data: WorldData,
-    voxel_vector: Arc<voxels::VoxelVector>,
     atlas: RgbaImage,
     texture_map: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>>,
     buffered_chunks: HashMap<Vector3<i32>, BufferedChunkData>,
@@ -342,7 +330,7 @@ impl<'a> State<'a> {
             } else {
                 let texture = Texture::from_rgba(&voxel_type.texture, 4, 4);
                 images.push((id, texture));
-                for i in 1..variants
+                for _ in 1..variants
                 {
                     let mut variant_pattern: Vec<Rgba<u8>> = voxel_type.texture.pattern.clone();
                     let pos1 = rng.gen_range(0..variant_pattern.len());
@@ -364,9 +352,6 @@ impl<'a> State<'a> {
         }
         let (atlas, texture_map) = find_optimal_atlas_size(images);
         atlas.save("texture_atlas.png").unwrap();
-
-        let diffuse_texture =
-            Texture::from_rgba_image(&device, &queue, &atlas, "atlas.png".into(), false).unwrap();
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -390,21 +375,6 @@ impl<'a> State<'a> {
                 ],
                 label: Some("Texture Bind Group Layout"),
             });
-
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
-                },
-            ],
-            label: Some("diffuse_bind_group"),
-        });
 
         let camera = camera::Camera::new((100.0, 100.0, 100.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
@@ -531,13 +501,10 @@ impl<'a> State<'a> {
             depth_texture,
             atlas,
             size,
-            diffuse_texture,
-            diffuse_bind_group,
             #[allow(dead_code)]
             mouse_pressed: false,
             world_data,
             texture_map: atlas_data,
-            voxel_vector,
             buffered_chunks,
             unfinished_chunks,
             texture_bind_group_layout,
@@ -653,10 +620,11 @@ impl<'a> State<'a> {
     }
 
     fn update(&mut self, dt: std::time::Duration) {
-        //applies all modifications to world at once
+        //applies all world mesh modifications
         start_modifications(&mut self.world_data);
+
+        //player control updates
         let player_chunk_position = get_chunk_pos_from_world(self.camera.position.to_vec());
-        //println!("chunk: {:?}", player_chunk_position);
         if self.camera_controller.amount_k_pressed > 0.0  {
             if !self.camera_controller.k_already_pressed {
                 self.place_sphere(5, 20.0, 5.0);
@@ -673,6 +641,8 @@ impl<'a> State<'a> {
         } else {
             self.camera_controller.j_already_pressed = false;
         }
+
+        //player camera updates
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
             .update_view_proj(&self.camera, &self.projection);
@@ -681,6 +651,8 @@ impl<'a> State<'a> {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
+
+        //thread updates
         if let Some(result) = self.world_data.finished_data_queue.dequeue()
         {
             if let Ok(mut chunks_data) = self.world_data.chunks_data.lock() {
@@ -688,7 +660,6 @@ impl<'a> State<'a> {
             }
             self.world_data.load_mesh_queue.enqueue(result.0);
         }
-        //println!("finished chunks: {:?}", self.world_data.finished_mesh_queue.length());
         if let Some(result) = self.world_data.finished_mesh_queue.dequeue() {
             let (position, chunk_mesh) = result;
             if let Some(chunk_mesh_result) = chunk_mesh
@@ -700,10 +671,8 @@ impl<'a> State<'a> {
         let mut calculated_chunks: Vec<Vector3<i32>> = Vec::new();
 
         for (position, buffered_chunk) in self.unfinished_chunks.iter_mut() {
-            // Poll the GPU to check if this chunk's texture is ready
             self.device.poll(wgpu::Maintain::Poll);
 
-            // Create the texture bind group dynamically from the chunk's texture
             let chunk_texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &self.texture_bind_group_layout,
                 entries: &[
@@ -721,50 +690,28 @@ impl<'a> State<'a> {
                 label: Some("Chunk Texture Bind Group"),
             });
 
-            // Move the data from unfinished_chunks to buffered_chunks
             let instance_buffer = replace(
                 &mut buffered_chunk.instance_buffer,
-                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+                create_dummy_buffer(&self.device),
             );
 
             let vertex_buffer = replace(
                 &mut *buffered_chunk.vertex_buffer.lock().unwrap(),
-                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+                create_dummy_buffer(&self.device),
             );
 
             let index_buffer = replace(
                 &mut *buffered_chunk.index_buffer.lock().unwrap(),
-                create_dummy_buffer(&self.device), // Replace with a dummy buffer
+                create_dummy_buffer(&self.device),
             );
 
-            let chunk_texture = replace(
-                &mut buffered_chunk.chunk_texture,
-                self.device.create_texture(&wgpu::TextureDescriptor { // Replace with a dummy texture
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-                    label: Some("Dummy Texture"),
-                    view_formats: &[],
-                }),
-            );
-
-            // Copy buffers as needed
             let vertex_buffer_copy = copy_buffer(&self.device, &self.queue, &vertex_buffer, vertex_buffer.size(), vertex_buffer.usage());
             let index_buffer_copy = copy_buffer(&self.device, &self.queue, &index_buffer, index_buffer.size(), index_buffer.usage());
-            // Insert into buffered_chunks
+
             self.buffered_chunks.insert(buffered_chunk.position, BufferedChunkData {
-                position: buffered_chunk.position,
-                instance: instance_buffer, // Use moved instance buffer
-                vertex_buffer: vertex_buffer_copy, // Use copied vertex buffer
-                index_buffer: index_buffer_copy,   // Use copied index buffer
-                chunk_texture,                     // Move the texture directly
+                instance: instance_buffer,
+                vertex_buffer: vertex_buffer_copy,
+                index_buffer: index_buffer_copy,
                 indices_length: buffered_chunk.indices_length,
                 chunk_texture_bind_group,
             });
@@ -772,10 +719,12 @@ impl<'a> State<'a> {
             calculated_chunks.push(*position);
         }
 
-        // After moving, remove the processed chunks
         for pos in calculated_chunks {
             self.unfinished_chunks.remove(&pos);
         }
+
+        //run game updates
+        run_game_updates()
     }
 
     fn unload_chunk(&mut self, position: Vector3<i32>) {
@@ -846,7 +795,7 @@ impl<'a> State<'a> {
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             // Render all buffered chunks
             //println!("Rendering {:?} chunks", self.buffered_chunks.len());
-            for (position, chunk) in self.buffered_chunks.iter() {
+            for (_, chunk) in self.buffered_chunks.iter() {
                 // Set the texture bind group for the chunk's texture
                 render_pass.set_bind_group(0, &chunk.chunk_texture_bind_group, &[]);
 
@@ -960,7 +909,7 @@ pub async fn run() {
 }
 
 pub fn process_raw_chunk(
-    mut raw_chunk: RawChunkRenderData,
+    raw_chunk: RawChunkRenderData,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     atlas: RgbaImage,
@@ -1156,13 +1105,13 @@ pub fn process_raw_chunk(
     });
 
     // 5. Create output buffers with Arc and Mutex for async handling
-    let mut vertex_output_buffer = Arc::new(Mutex::new(device.create_buffer(&wgpu::BufferDescriptor {
+    let vertex_output_buffer = Arc::new(Mutex::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Vertex Output Buffer"),
         size: (vertices_flat.len() * std::mem::size_of::<ChunkMeshVertex>()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::VERTEX,
         mapped_at_creation: false,
     })));
-    let mut index_output_buffer = Arc::new(Mutex::new(device.create_buffer(&wgpu::BufferDescriptor {
+    let index_output_buffer = Arc::new(Mutex::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Index Output Buffer"),
         size: (indices_flat.len() * std::mem::size_of::<u32>()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::INDEX,
@@ -1562,14 +1511,6 @@ fn pack_rects_in_rows(rects: &Vec<Rect>, output_width: u32, output_height: u32) 
     (placed_positions, placed_widths)
 }
 
-#[derive(Copy, Clone)]
-pub struct RawRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
 fn copy_texture(
     device: &wgpu::Device,
     src_texture: &wgpu::Texture,
@@ -1679,7 +1620,7 @@ fn get_rect_direction(rect: &Rect) -> &'static str {
 }
 
 fn print_rect_directions(rects: Vec<Rect>) {
-    for (i, rect) in rects.iter().enumerate() {
+    for (_, rect) in rects.iter().enumerate() {
         let direction = get_rect_direction(rect);
         println!("Rect {:?} is facing {}", rect, direction);
     }
