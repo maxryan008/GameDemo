@@ -120,11 +120,7 @@ pub fn index_to_vector3i_bounds_reverse(i: i32, bounds: i32) -> Vector3<i32> {
 #[inline]
 pub fn vector3i_to_index(pos: Vector3<i32>, bounds: i32) -> usize {
     let x_i = pos.x % bounds;
-    // let y_i = (pos.y * bounds) % bounds;
     let y_i = (pos.y * bounds);
     let z_i = pos.z * (bounds * bounds);
-    // let x_i = pos.x % bounds;
-    // let y_i = (pos.y / bounds) % bounds;
-    // let z_i = pos.z / (bounds * bounds);
     (x_i + y_i + z_i) as usize
 }

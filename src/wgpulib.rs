@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::{iter, thread};
 use std::mem::replace;
-use std::ops::{Add, Deref, RangeFull};
+use std::ops::{Add, Deref, Div, RangeFull};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use cgmath::prelude::*;
@@ -23,7 +23,7 @@ use winit::window::CursorGrabMode;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use crate::{camera, logger, texture_packer, timeit, vertex_types, voxels, world_handler};
-use crate::constants::CHUNK_SIZE;
+use crate::constants::{CHUNK_SIZE, TEXTURE_OUTPUT_SIZE};
 use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, Rect, WorldData};
 use crate::texture;
 use crate::texture::Texture;
@@ -165,7 +165,7 @@ fn create_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         address_mode_w: wgpu::AddressMode::ClampToEdge, // W axis (used for 3D textures)
         mag_filter: wgpu::FilterMode::Nearest, // How to interpolate when magnifying the texture
         min_filter: wgpu::FilterMode::Nearest, // How to interpolate when minifying the texture
-        mipmap_filter: wgpu::FilterMode::Nearest, // How to interpolate between mipmap levels
+        mipmap_filter: wgpu::FilterMode::Linear, // How to interpolate between mipmap levels
         lod_min_clamp: 0.0, // Level of detail (LOD) min clamp
         lod_max_clamp: 100.0, // LOD max clamp
         compare: None, // Optional depth comparison mode
@@ -799,7 +799,7 @@ pub async fn run() {
 
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = instant::Instant::now();
-    let world_size_cubed = 3;
+    let world_size_cubed = 7;
     for x in 0..world_size_cubed
     {
         for y in 0..world_size_cubed
@@ -913,8 +913,8 @@ pub fn process_raw_chunk(
     // 2. Create output texture for stitched result
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
         size: wgpu::Extent3d {
-            width: 1024,
-            height: 1024,
+            width: TEXTURE_OUTPUT_SIZE,
+            height: TEXTURE_OUTPUT_SIZE,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -955,10 +955,10 @@ pub fn process_raw_chunk(
     rects_blocks_sizes.push(blocks_flat.len() as u32);
     rects_tints_sizes.push(tints_flat.len() as u32);
 
-    println!("{:?}", blocks_flat);
 
     //todo make width and height automatic
-    let (packed_positions, rects_widths): (Vec<[u32;2]>, Vec<u32>) = pack_rects_in_rows(&raw_chunk.rects, 1024, 1024);
+    //print_rect_directions(raw_chunk.rects.clone());
+    let (packed_positions, rects_widths): (Vec<[u32;2]>, Vec<u32>) = pack_rects_in_rows(&raw_chunk.rects, TEXTURE_OUTPUT_SIZE / 4, TEXTURE_OUTPUT_SIZE / 4);
 
     // Upload the packed_positions to the GPU
     let positions_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1031,7 +1031,7 @@ pub fn process_raw_chunk(
     let mut cumulative_sum: u32 = 0;
 
     for id in sorted_keys {
-        // Get the value associated with the current id
+        // Get the value associated width the current id
         if let Some((variants, width, height)) = texture_map.get(&id) {
             // Flatten the variants into the texture_map_data
             for variant in variants {
@@ -1394,7 +1394,7 @@ pub fn process_raw_chunk(
         pass.set_bind_group(0, &bind_group_0, &[]);
         pass.set_bind_group(1, &bind_group_1, &[]);
         pass.set_bind_group(2, &bind_group_2, &[]);
-        pass.dispatch_workgroups(raw_chunk.rects.len() as u32, 1, 1);
+        pass.dispatch_workgroups(raw_chunk.rects.len().div_ceil(10) as u32, 10, 1);
     }
 
     // Submit the commands to the GPU without blocking
@@ -1481,15 +1481,14 @@ fn copy_texture(
     device: &wgpu::Device,
     src_texture: &wgpu::Texture,
 ) -> wgpu::Texture {
-    // Hardcode the texture descriptor for a 1024x1024 RGBA texture
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Texture Cloning Encoder"),
     });
 
     let texture_desc = wgpu::TextureDescriptor {
         size: wgpu::Extent3d {
-            width: 1024,
-            height: 1024,
+            width: TEXTURE_OUTPUT_SIZE,
+            height: TEXTURE_OUTPUT_SIZE,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -1553,4 +1552,42 @@ fn create_dummy_buffer(device: &wgpu::Device) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
+}
+
+fn get_rect_direction(rect: &Rect) -> &'static str {
+    let v = &rect.vertices;
+
+    // Check if all vertices share the same X coordinate (Left or Right face)
+    if v[0][0] == v[1][0] && v[0][0] == v[2][0] && v[0][0] == v[3][0] {
+        if v[0][0] == 0.0 {
+            "Left" // X = 0 face (Left face)
+        } else {
+            "Right" // X = CHUNK_SIZE face (Right face)
+        }
+    }
+    // Check if all vertices share the same Y coordinate (Up or Down face)
+    else if v[0][1] == v[1][1] && v[0][1] == v[2][1] && v[0][1] == v[3][1] {
+        if v[0][1] == 0.0 {
+            "Down" // Y = 0 face (Down face)
+        } else {
+            "Up" // Y = CHUNK_SIZE face (Up face)
+        }
+    }
+    // Check if all vertices share the same Z coordinate (Front or Back face)
+    else if v[0][2] == v[1][2] && v[0][2] == v[2][2] && v[0][2] == v[3][2] {
+        if v[0][2] == 0.0 {
+            "Front" // Z = 0 face (Front face)
+        } else {
+            "Back" // Z = CHUNK_SIZE face (Back face)
+        }
+    } else {
+        "Unknown" // In case it does not match any expected face
+    }
+}
+
+fn print_rect_directions(rects: Vec<Rect>) {
+    for (i, rect) in rects.iter().enumerate() {
+        let direction = get_rect_direction(rect);
+        println!("Rect {:?} is facing {}", rect, direction);
+    }
 }

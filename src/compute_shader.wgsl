@@ -62,21 +62,21 @@ fn get_texture_coords(
     vertex_index: u32 // 0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left
 ) -> PackedVec2Float {
     // Base normalized coordinates based on the rectangle's position
-    let base_tex_x = f32(pos.x) / output_size.x;
-    let base_tex_y = f32(pos.y) / output_size.y;
+    let base_tex_x = f32(pos.x) / (output_size.x / 4.0);
+    let base_tex_y = f32(pos.y) / (output_size.y / 4.0);
 
     // Add width and height to calculate the coordinates based on the vertex
     var tex_x: f32 = base_tex_x;
     var tex_y: f32 = base_tex_y;
 
     // Adjust tex_x and tex_y based on which corner (vertex) we are calculating for
-    if (vertex_index == 1u || vertex_index == 2u) {
+    if (vertex_index == 0u || vertex_index == 3u) {
         // Top-right or bottom-right corner
-        tex_x = base_tex_x + f32(width) / output_size.x;
+        tex_x = base_tex_x + f32(width) / (output_size.x/4.0);
     }
-    if (vertex_index == 2u || vertex_index == 3u) {
+    if (vertex_index == 3u || vertex_index == 2u) {
         // Bottom-right or bottom-left corner
-        tex_y = base_tex_y + f32(height) / output_size.y;
+        tex_y = base_tex_y + f32(height) / (output_size.y / 4.0);
     }
 
     return PackedVec2Float(f32(tex_x), f32(tex_y));
@@ -84,7 +84,7 @@ fn get_texture_coords(
 
 @compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let rect_index = global_id.x;
+    let rect_index = global_id.x * 10 + global_id.y;
 
     // Get rect position in the output texture (top-left corner)
     let rect_pos = rect_positions[rect_index];
@@ -92,8 +92,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     //todo make sizes automatically calculated
     let atlas_texture_width = 128.0;
     let atlas_texture_height = 128.0;
-    let output_texture_width = 1024.0;
-    let output_texture_height = 1024.0;
+    let output_texture_width = 4096.0;
+    let output_texture_height = 4096.0;
 
     let pixel_size_x = 1.0 / f32(atlas_texture_width);
     let pixel_size_y = 1.0 / f32(atlas_texture_height);
@@ -120,7 +120,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         // Compute the normalized texture coordinates for this vertex
         let vertex_index = (i - vertices_start);  // Determines which corner we are dealing with
-        let tex_coords = get_texture_coords(rect_width, rect_height, rect_pos, PackedVec2Float(output_texture_width / 4.0, output_texture_height / 4.0), vertex_index);
+        let tex_coords = get_texture_coords(rect_width, rect_height, rect_pos, PackedVec2Float(output_texture_width, output_texture_height), vertex_index);
 
         // Write vertex data to output
         vertex_output[i] = ChunkMeshVertex(
@@ -135,9 +135,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Write the blocks to the output texture using the correct normalized texture coordinates
-    for (var block_x = 0u; block_x < rect_height; block_x = block_x + 1u) {
-        for (var block_y = 0u; block_y < rect_width; block_y = block_y + 1u) {
-            let block_index = block_y * rect_height + block_x;
+    for (var block_x = 0u; block_x < rect_width; block_x = block_x + 1u) {
+        for (var block_y = 0u; block_y < rect_height; block_y = block_y + 1u) {
+            let block_index = (rect_height - 1 - block_y) * rect_width + block_x;
 
             // Get the block type from blocks_flat
             let block_type = blocks_flat[blocks_start + block_index];

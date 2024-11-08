@@ -217,22 +217,44 @@ impl ChunkData {
     {
         let mut voxels: Vec<u32> = Vec::new();
         let mut rng = ThreadRng::default();
-        let types = vec![5,0,6];
-        let mut voxel_type = 0;
         let mut t = false;
-        // if thread_rng().gen_bool(1.0/2.0) {
-        //     t = true;
-        // }
-        if chunk_pos.x == 1 && chunk_pos.y == 1 && chunk_pos.z == 1 {
+        if thread_rng().gen_bool(1.0/1.1) {
             t = true;
         }
+        // if chunk_pos.x == 1 && chunk_pos.y == 1 && chunk_pos.z == 1 {
+        //     t = true;
+        // }
+        let surface = 80;
+        let under_surface = 70;
 
-        for i in 0..CHUNK_SIZE3 as usize
-        {
-            if t {
-                voxel_type = types[rng.sample(Uniform::new(0, types.len()))];
+        if t {
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for z in 0..CHUNK_SIZE {
+                        if (y + chunk_pos.y as usize * CHUNK_SIZE) < surface {
+                            if (y + chunk_pos.y as usize * CHUNK_SIZE) < under_surface {
+                                voxels.push(5);
+                            } else {
+                                if thread_rng().gen_bool((y + chunk_pos.y as usize * CHUNK_SIZE - under_surface) as f64 / (surface - under_surface) as f64) {
+                                    voxels.push(6);
+                                } else {
+                                    if (y + chunk_pos.y as usize * CHUNK_SIZE + 1) == surface {
+                                        voxels.push(6);
+                                    } else {
+                                        voxels.push(5);
+                                    }
+                                }
+                            }
+                        } else {
+                            voxels.push(0);
+                        }
+                    }
+                }
             }
-            voxels.push(voxel_type);
+        } else {
+            for i in 0..CHUNK_SIZE3 {
+                voxels.push(0);
+            }
         }
         ChunkData
         {
