@@ -84,6 +84,8 @@ pub struct CameraController {
     rotate_horizontal: f32,
     rotate_vertical: f32,
     pub amount_l_pressed: f32,
+    pub amount_k_pressed: f32,
+    pub k_already_pressed: bool,
     scroll: f32,
     speed: f32,
     sensitivity: f32,
@@ -101,6 +103,8 @@ impl CameraController {
             rotate_horizontal: 0.0,
             rotate_vertical: 0.0,
             amount_l_pressed: 0.0,
+            amount_k_pressed: 0.0,
+            k_already_pressed: false,
             scroll: 0.0,
             speed,
             sensitivity,
@@ -140,6 +144,10 @@ impl CameraController {
             }
             KeyCode::KeyL => {
                 self.amount_l_pressed = amount;
+                true
+            }
+            KeyCode::KeyK => {
+                self.amount_k_pressed = amount;
                 true
             }
             _ => false,

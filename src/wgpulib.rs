@@ -3,14 +3,14 @@ use std::{iter, thread};
 use std::mem::replace;
 use std::ops::{Add, Deref, Div, RangeFull};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use cgmath::prelude::*;
 use std::sync::mpsc;
 use cgmath::{Quaternion, Vector2, Vector3};
 use image::{Rgba, RgbaImage};
 use pollster::block_on;
 use rand::{thread_rng, Rng};
-use wgpu::{BindGroupLayout, Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferSlice, CommandEncoder, Device, MaintainResult, Sampler};
+use wgpu::{BindGroupLayout, Buffer, BufferAddress, BufferBindingType, BufferDescriptor, BufferSlice, CommandEncoder, Device, MaintainResult, Sampler, SurfaceConfiguration};
 use wgpu::hal::empty::Encoder;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::{
@@ -19,12 +19,14 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
-use winit::window::CursorGrabMode;
+use winit::monitor::MonitorHandle;
+use winit::window::{CursorGrabMode, Fullscreen};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 use crate::{camera, logger, texture_packer, timeit, vertex_types, voxels, world_handler};
 use crate::constants::{CHUNK_SIZE, TEXTURE_OUTPUT_SIZE};
-use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, Rect, WorldData};
+use crate::face_direction::{FaceDir, FACES};
+use crate::greedy_mesher::{start_data_tasks, start_mesh_tasks, start_modifications, unload_data, Rect, WorldData};
 use crate::texture;
 use crate::texture::Texture;
 use crate::texture_packer::find_optimal_atlas_size;
@@ -33,6 +35,7 @@ use crate::voxels::{TexturePattern, VoxelVector};
 use crate::world_handler::{ArcQueue, Queue, DataWorker};
 
 const CULL_BACK_FACE: bool = true;
+const FULL_SCREEN: bool = true;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -403,7 +406,7 @@ impl<'a> State<'a> {
             label: Some("diffuse_bind_group"),
         });
 
-        let camera = camera::Camera::new((0.0, 0.0, 1.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let camera = camera::Camera::new((100.0, 100.0, 100.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
             camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
         let camera_controller = camera::CameraController::new( 20.0, 1.0); //speed
@@ -487,8 +490,12 @@ impl<'a> State<'a> {
 
         let atlas_data: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>> = Arc::new(texture_map);
 
+        let mut rng = rand::thread_rng();
+        let seed: u32 = rng.gen();
+
         let mut world_data: WorldData = WorldData
         {
+            seed,
             chunks_data: Arc::new(Mutex::new(HashMap::new())),
             load_data_queue: ArcQueue::new(),
             load_mesh_queue: ArcQueue::new(),
@@ -581,6 +588,18 @@ impl<'a> State<'a> {
     }
 
     fn update(&mut self, dt: std::time::Duration) {
+        //applies all modifications to world at once
+        start_modifications(&mut self.world_data);
+        let player_chunk_position = get_chunk_pos_from_world(self.camera.position.to_vec());
+        //println!("chunk: {:?}", player_chunk_position);
+        if self.camera_controller.amount_k_pressed > 0.0  {
+            if !self.camera_controller.k_already_pressed {
+                self.world_data.queue_block_modification(self.camera.position.to_vec().map(|x| x.floor() as i32), 5);
+                self.camera_controller.k_already_pressed = true;
+            }
+        } else {
+            self.camera_controller.k_already_pressed = false;
+        }
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
             .update_view_proj(&self.camera, &self.projection);
@@ -601,7 +620,7 @@ impl<'a> State<'a> {
             let (position, chunk_mesh) = result;
             if let Some(chunk_mesh_result) = chunk_mesh
             {
-                self.unfinished_chunks.insert(position, process_raw_chunk(chunk_mesh_result, &self.device, &self.queue, self.atlas.clone(), self.texture_map.clone()));
+                self.unfinished_chunks.insert(position, process_raw_chunk(chunk_mesh_result, &self.device, &self.queue, self.atlas.clone(), self.texture_map.clone(), self.world_data.seed));
             }
         }
 
@@ -666,7 +685,6 @@ impl<'a> State<'a> {
             // Copy buffers as needed
             let vertex_buffer_copy = copy_buffer(&self.device, &self.queue, &vertex_buffer, vertex_buffer.size(), vertex_buffer.usage());
             let index_buffer_copy = copy_buffer(&self.device, &self.queue, &index_buffer, index_buffer.size(), index_buffer.usage());
-
             // Insert into buffered_chunks
             self.buffered_chunks.insert(buffered_chunk.position, BufferedChunkData {
                 position: buffered_chunk.position,
@@ -687,23 +705,23 @@ impl<'a> State<'a> {
         }
     }
 
-    fn unload_chunk(&mut self, position: Vector3<i32>)
-    {
-        /*
-        logger::log_raw("Unloaded chunk at ", position);
-        if self.world.chunks.contains_key(&position)
-        {
-            self.world.chunks.remove(&position);
+    fn unload_chunk(&mut self, position: Vector3<i32>) {
+        if self.world_data.chunks_data.lock().unwrap().contains_key(&position) {
+            logger::log_raw("Unloading chunk at", position);
+            self.world_data.chunks_data.lock().unwrap().remove(&position);
+            self.buffered_chunks.remove(&position);
+
+            if self.unfinished_chunks.remove(&position).is_some() {
+                logger::log_raw("Removed unfinished chunk at", position);
+            }
+        } else {
+            logger::log_raw("Error: Attempted to unload non-existent chunk at", position);
         }
-        */
     }
 
     fn load_chunk(&mut self, position: Vector3<i32>)
     {
         self.world_data.load_data_queue.enqueue(position);
-        /*
-        self.update_chunk(position);
-        */
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -753,9 +771,9 @@ impl<'a> State<'a> {
             }
 
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-                // Render all buffered chunks
-                println!("Rendering {:?} chunks", self.buffered_chunks.len());
-                for (position, chunk) in self.buffered_chunks.iter() {
+            // Render all buffered chunks
+            //println!("Rendering {:?} chunks", self.buffered_chunks.len());
+            for (position, chunk) in self.buffered_chunks.iter() {
                 // Set the texture bind group for the chunk's texture
                 render_pass.set_bind_group(0, &chunk.chunk_texture_bind_group, &[]);
 
@@ -792,10 +810,15 @@ pub async fn run() {
 
     let event_loop = EventLoop::new().unwrap();
     let title = env!("CARGO_PKG_NAME");
+    let mut fullscreen = None;
+    if FULL_SCREEN {
+        fullscreen = Some(Fullscreen::Borderless(None));
+    }
     let window = winit::window::WindowBuilder::new()
         .with_title(title)
+        .with_fullscreen(fullscreen)
         .build(&event_loop)
-        .unwrap();
+        .expect("Failed to create window");
 
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = instant::Instant::now();
@@ -869,6 +892,7 @@ pub fn process_raw_chunk(
     queue: &wgpu::Queue,
     atlas: RgbaImage,
     texture_map: Arc<HashMap<u32, (Vec<Vector2<u32>>, u32, u32)>>,
+    seed: u32,
 ) -> BufferedChunk
 {
     let atlas_size = atlas.dimensions();
@@ -925,10 +949,6 @@ pub fn process_raw_chunk(
         label: Some("Output Texture"),
         view_formats: &[],
     });
-
-    // 3. Prepare the seed for random variant selection
-    let mut rng = rand::thread_rng();
-    let random_seed: u32 = rng.gen(); // Generate a random seed
 
     // 4. Flatten the rect data and create buffers
     let mut vertices_flat: Vec<[f32; 3]> = vec![];
@@ -1058,7 +1078,7 @@ pub fn process_raw_chunk(
 
     let seed_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Seed Buffer"),
-        contents: bytemuck::cast_slice(&[random_seed]),
+        contents: bytemuck::cast_slice(&[seed]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
@@ -1590,4 +1610,14 @@ fn print_rect_directions(rects: Vec<Rect>) {
         let direction = get_rect_direction(rect);
         println!("Rect {:?} is facing {}", rect, direction);
     }
+}
+
+pub fn get_chunk_pos_from_world(world_pos: Vector3<f32>) -> Vector3<i32>
+{
+    Vector3::new((world_pos.x / CHUNK_SIZE as f32).floor() as i32, (world_pos.y / CHUNK_SIZE as f32).floor() as i32, (world_pos.z / CHUNK_SIZE as f32).floor() as i32)
+}
+
+pub fn vec3_i32_f32(v: Vector3<i32>) -> Vector3<f32>
+{
+    v.map(|x| x as f32)
 }

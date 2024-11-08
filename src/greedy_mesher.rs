@@ -1,18 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::exit;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use cgmath::{Array, Rotation3, Vector2, Vector3, Zero};
 use cgmath::num_traits::AsPrimitive;
 use log::error;
+use rand::{thread_rng, Rng};
 use tobj::Mesh;
 use wgpu::PrimitiveTopology;
 use winit::keyboard::NamedKey::Exit;
 use crate::chunks_refs::{vector3i_to_index, ChunksRefs};
-use crate::constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE2, CHUNK_SIZE2_I32, CHUNK_SIZE_I32, CHUNK_SIZE_P};
+use crate::constants::{ADJACENT_AO_DIRS, CHUNK_SIZE, CHUNK_SIZE2, CHUNK_SIZE2_I32, CHUNK_SIZE3, CHUNK_SIZE_I32, CHUNK_SIZE_P};
 use crate::face_direction::FaceDir;
 use crate::lod::Lod;
 use crate::voxels::VoxelVector;
-use crate::wgpulib::{ChunkInstance, ChunkInstanceRaw, RawChunkRenderData};
+use crate::wgpulib::{get_chunk_pos_from_world, vec3_i32_f32, ChunkInstance, ChunkInstanceRaw, RawChunkRenderData};
 use crate::{logger, voxels, world_handler};
 use crate::vertex_types::WorldMeshVertex;
 use crate::world_handler::{generate_indices, make_vertex_u32, ArcQueue, ChunkData, Queue, DataWorker, MeshWorker, ChunkRaw};
@@ -366,6 +368,7 @@ pub fn greedy_mesh_binary_plane(mut data: [u64; 64], lod_size: u32) -> Vec<Greed
 pub struct ChunkModification(pub Vector3<i32>, pub u32);
 pub struct WorldData {
     pub chunks_data: Arc<Mutex<HashMap<Vector3<i32>, Arc<ChunkData>>>>,
+    pub seed: u32,
     pub load_data_queue: ArcQueue<Vector3<i32>>,
     pub load_mesh_queue: ArcQueue<Vector3<i32>>,
     pub finished_data_queue: ArcQueue<(Vector3<i32>, ChunkData)>,
@@ -379,6 +382,21 @@ impl WorldData {
     pub fn unload_all_meshes(&mut self) {
         self.load_mesh_queue.clear();
         self.load_data_queue.clear();
+    }
+
+    pub fn queue_block_modification(&mut self, world_pos: Vector3<i32>, block_type: u32) {
+        let chunk_pos = get_chunk_pos_from_world(vec3_i32_f32(world_pos));
+        let local_pos = Vector3::new(
+            world_pos.x.rem_euclid(CHUNK_SIZE_I32),
+            world_pos.y.rem_euclid(CHUNK_SIZE_I32),
+            world_pos.z.rem_euclid(CHUNK_SIZE_I32),
+        );
+
+        // Insert modification into the chunk_modifications map
+        self.chunk_modifications
+            .entry(chunk_pos)
+            .or_insert_with(Vec::new)
+            .push(ChunkModification(local_pos, block_type));
     }
 }
 
@@ -463,35 +481,37 @@ pub fn start_mesh_tasks(
     world_data.finished_mesh_queue = finished_mesh_queue;
 }
 
-pub fn start_modifications(mut world_data: WorldData) {
-    for (pos, mods) in world_data.chunk_modifications.drain() {
+pub fn start_modifications(world_data: &mut WorldData) {
+    for (chunk_pos, mods) in world_data.chunk_modifications.drain() {
         if let Ok(mut chunks_data) = world_data.chunks_data.lock() {
-            let Some(chunk_data) = chunks_data.get_mut(&pos) else {
-                continue;
-            };
-            let new_chunk_data = Arc::make_mut(chunk_data);
-            let mut adj_chunk_set = HashSet::new();
-            for ChunkModification(local_pos, block_type) in mods.into_iter() {
-                let i = vector3i_to_index(local_pos, CHUNK_SIZE_I32);
-                if new_chunk_data.voxels.len() == 1 {
-                    let mut voxels = vec![];
-                    for _ in 0..CHUNK_SIZE_I32 * CHUNK_SIZE_I32 * CHUNK_SIZE_I32 {
-                        voxels.push(new_chunk_data.voxels[0]);
+            // Get mutable reference to chunk data if it exists
+            if let Some(chunk_data) = chunks_data.get_mut(&chunk_pos).map(Arc::make_mut) {
+                let mut adj_chunk_set = HashSet::new();
+
+                for ChunkModification(local_pos, block_type) in mods {
+                    let index = vector3i_to_index(local_pos, CHUNK_SIZE_I32);
+
+                    // Ensure voxels vector is expanded if necessary
+                    if chunk_data.voxels.len() == 1 {
+                        chunk_data.voxels = vec![chunk_data.voxels[0]; CHUNK_SIZE_I32.pow(3) as usize];
                     }
-                    new_chunk_data.voxels = voxels;
+
+                    // Update voxel in chunk data
+                    chunk_data.voxels[index] = block_type;
+
+                    // Track neighboring chunks if modification is on a chunk edge
+                    if let Some(edge_chunk) = get_edging_chunk(local_pos) {
+                        adj_chunk_set.insert(chunk_pos + edge_chunk);
+                    }
                 }
-                new_chunk_data.voxels[i] = block_type;
-                if let Some(edge_chunk) = get_edging_chunk(local_pos) {
-                    adj_chunk_set.insert(edge_chunk);
+
+                // Enqueue mesh updates for adjacent chunks and the modified chunk
+                for adj_chunk in adj_chunk_set {
+                    world_data.load_mesh_queue.enqueue(adj_chunk);
                 }
+                world_data.load_mesh_queue.enqueue(chunk_pos);
             }
-            for adj_chunk in adj_chunk_set.into_iter() {
-                world_data.load_mesh_queue.enqueue(pos + adj_chunk);
-            }
-            world_data.load_mesh_queue.enqueue(pos);
-        } else {
-            continue;
-        };
+        }
     }
 }
 

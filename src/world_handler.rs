@@ -216,14 +216,10 @@ impl ChunkData {
     pub fn generate(chunk_pos: Vector3<i32>) -> Self
     {
         let mut voxels: Vec<u32> = Vec::new();
-        let mut rng = ThreadRng::default();
         let mut t = false;
         if thread_rng().gen_bool(1.0/1.1) {
             t = true;
         }
-        // if chunk_pos.x == 1 && chunk_pos.y == 1 && chunk_pos.z == 1 {
-        //     t = true;
-        // }
         let surface = 80;
         let under_surface = 70;
 
@@ -468,6 +464,20 @@ impl ChunkData {
             &self.voxels[0]
         } else {
             &self.voxels[index]
+        }
+    }
+
+    #[inline]
+    pub fn set_voxel(&mut self, index: usize, new_value: u32) {
+        if self.voxels.len() == 1 {
+            // If `voxels` has only one element, expand it to be able to handle individual indices
+            let current_value = self.voxels[0];
+            self.voxels = vec![current_value; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+        }
+        if index < self.voxels.len() {
+            self.voxels[index] = new_value;
+        } else {
+            println!("Index out of bounds: {}", index);
         }
     }
 
