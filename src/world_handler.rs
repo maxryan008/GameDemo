@@ -220,8 +220,8 @@ impl ChunkData {
         if thread_rng().gen_bool(1.0/1.1) {
             t = true;
         }
-        let surface = 80;
-        let under_surface = 70;
+        let surface = 150;
+        let under_surface = 125;
 
         if t {
             for x in 0..CHUNK_SIZE {

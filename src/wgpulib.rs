@@ -597,6 +597,51 @@ impl<'a> State<'a> {
         self.world_data.queue_block_modification(block_position, block_type);
     }
 
+    pub fn place_sphere(&mut self, block_type: u32, distance: f32, radius: f32) {
+        let look_direction = self.camera.forward();
+        let center_position = self.camera.position.to_vec() + (look_direction * distance);
+        let center_block_position = center_position.map(|x| x.floor() as i32);
+
+        let int_radius = radius.ceil() as i32;
+        for x in -int_radius..=int_radius {
+            for y in -int_radius..=int_radius {
+                for z in -int_radius..=int_radius {
+                    let offset = Vector3::new(x, y, z);
+                    let block_position = center_block_position + offset;
+
+                    let distance_from_center = offset.map(|c| c as f32).magnitude();
+
+                    if distance_from_center <= radius {
+                        self.world_data.queue_block_modification(block_position, block_type);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn break_sphere(&mut self, distance: f32, radius: f32) {
+        let look_direction = self.camera.forward();
+        let center_position = self.camera.position.to_vec() + (look_direction * distance);
+        let center_block_position = center_position.map(|x| x.floor() as i32);
+
+        let int_radius = radius.ceil() as i32;
+        for x in -int_radius..=int_radius {
+            for y in -int_radius..=int_radius {
+                for z in -int_radius..=int_radius {
+                    let offset = Vector3::new(x, y, z);
+                    let block_position = center_block_position + offset;
+
+                    let distance_from_center = offset.map(|c| c as f32).magnitude();
+
+                    if distance_from_center <= radius {
+                        self.world_data.queue_block_modification(block_position, 0);
+                    }
+                }
+            }
+        }
+    }
+
+
     pub fn break_block_in_front(&mut self, distance: f32) {
         let look_direction = self.camera.forward();
 
@@ -614,7 +659,7 @@ impl<'a> State<'a> {
         //println!("chunk: {:?}", player_chunk_position);
         if self.camera_controller.amount_k_pressed > 0.0  {
             if !self.camera_controller.k_already_pressed {
-                self.place_block_in_front(5, 10.0);
+                self.place_sphere(5, 20.0, 5.0);
                 self.camera_controller.k_already_pressed = true;
             }
         } else {
@@ -622,7 +667,7 @@ impl<'a> State<'a> {
         }
         if self.camera_controller.amount_j_pressed > 0.0  {
             if !self.camera_controller.j_already_pressed {
-                self.break_block_in_front(10.0);
+                self.break_sphere(20.0, 5.0);
                 self.camera_controller.j_already_pressed = true;
             }
         } else {
