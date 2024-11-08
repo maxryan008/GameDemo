@@ -35,6 +35,12 @@ impl Camera {
         }
     }
 
+    pub fn forward(&self) -> Vector3<f32> {
+        let (sin_pitch, cos_pitch) = self.pitch.0.sin_cos();
+        let (sin_yaw, cos_yaw) = self.yaw.0.sin_cos();
+        Vector3::new(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize()
+    }
+
     pub fn calc_matrix(&self) -> Matrix4<f32> {
         let (sin_pitch, cos_pitch) = self.pitch.0.sin_cos();
         let (sin_yaw, cos_yaw) = self.yaw.0.sin_cos();
@@ -85,7 +91,9 @@ pub struct CameraController {
     rotate_vertical: f32,
     pub amount_l_pressed: f32,
     pub amount_k_pressed: f32,
+    pub amount_j_pressed: f32,
     pub k_already_pressed: bool,
+    pub j_already_pressed: bool,
     scroll: f32,
     speed: f32,
     sensitivity: f32,
@@ -104,7 +112,9 @@ impl CameraController {
             rotate_vertical: 0.0,
             amount_l_pressed: 0.0,
             amount_k_pressed: 0.0,
+            amount_j_pressed: 0.0,
             k_already_pressed: false,
+            j_already_pressed: false,
             scroll: 0.0,
             speed,
             sensitivity,
@@ -148,6 +158,10 @@ impl CameraController {
             }
             KeyCode::KeyK => {
                 self.amount_k_pressed = amount;
+                true
+            }
+            KeyCode::KeyJ => {
+                self.amount_j_pressed = amount;
                 true
             }
             _ => false,

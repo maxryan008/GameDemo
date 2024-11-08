@@ -587,6 +587,26 @@ impl<'a> State<'a> {
         }
     }
 
+    pub fn place_block_in_front(&mut self, block_type: u32, distance: f32) {
+        let look_direction = self.camera.forward();
+
+        let target_position = self.camera.position.to_vec() + (look_direction * distance);
+
+        let block_position = target_position.map(|x| x.floor() as i32);
+
+        self.world_data.queue_block_modification(block_position, block_type);
+    }
+
+    pub fn break_block_in_front(&mut self, distance: f32) {
+        let look_direction = self.camera.forward();
+
+        let target_position = self.camera.position.to_vec() + (look_direction * distance);
+
+        let block_position = target_position.map(|x| x.floor() as i32);
+
+        self.world_data.queue_block_modification(block_position, 0);
+    }
+
     fn update(&mut self, dt: std::time::Duration) {
         //applies all modifications to world at once
         start_modifications(&mut self.world_data);
@@ -594,11 +614,19 @@ impl<'a> State<'a> {
         //println!("chunk: {:?}", player_chunk_position);
         if self.camera_controller.amount_k_pressed > 0.0  {
             if !self.camera_controller.k_already_pressed {
-                self.world_data.queue_block_modification(self.camera.position.to_vec().map(|x| x.floor() as i32), 5);
+                self.place_block_in_front(5, 10.0);
                 self.camera_controller.k_already_pressed = true;
             }
         } else {
             self.camera_controller.k_already_pressed = false;
+        }
+        if self.camera_controller.amount_j_pressed > 0.0  {
+            if !self.camera_controller.j_already_pressed {
+                self.break_block_in_front(10.0);
+                self.camera_controller.j_already_pressed = true;
+            }
+        } else {
+            self.camera_controller.j_already_pressed = false;
         }
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
